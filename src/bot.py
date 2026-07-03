@@ -5,6 +5,7 @@ import os
 import random
 import re
 import sqlite3
+import tempfile
 import textwrap
 from contextlib import closing
 from datetime import datetime, time, timedelta, timezone
@@ -14,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -40,6 +41,7 @@ BOT_COMMANDS = [
     ("roast", "Подколоть друга по его сообщениям: /roast @username"),
     ("votekick", "Шуточное голосование за изгнание из чата"),
     ("horoscope", "Гороскоп чата на завтра"),
+    ("backup", "Сделать бэкап базы прямо сейчас"),
 ]
 
 RAT_CHARACTER_INTRO = (
@@ -153,6 +155,17 @@ def get_allowed_chat_id() -> int | None:
         raise RuntimeError("CHAT_ID must be an integer or empty") from exc
 
 
+def get_backup_chat_id() -> int | None:
+    chat_id = os.getenv("BACKUP_CHAT_ID", "").strip()
+    if not chat_id:
+        return None
+
+    try:
+        return int(chat_id)
+    except ValueError as exc:
+        raise RuntimeError("BACKUP_CHAT_ID must be an integer or empty") from exc
+
+
 def get_digest_time(tz: ZoneInfo) -> time | None:
     raw = os.getenv("DIGEST_TIME", "").strip()
     if not raw:
@@ -165,6 +178,22 @@ def get_digest_time(tz: ZoneInfo) -> time | None:
             raise ValueError
     except ValueError as exc:
         raise RuntimeError(f"DIGEST_TIME must be in HH:MM format, got {raw!r}") from exc
+
+    return time(hour=hour, minute=minute, tzinfo=tz)
+
+
+def get_backup_time(tz: ZoneInfo) -> time | None:
+    raw = os.getenv("BACKUP_TIME", "").strip()
+    if not raw:
+        return None
+
+    try:
+        hour_str, minute_str = raw.split(":", 1)
+        hour, minute = int(hour_str), int(minute_str)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError as exc:
+        raise RuntimeError(f"BACKUP_TIME must be in HH:MM format, got {raw!r}") from exc
 
     return time(hour=hour, minute=minute, tzinfo=tz)
 
@@ -1440,6 +1469,90 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def count_all_messages() -> int:
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        row = connection.execute("SELECT COUNT(*) FROM messages").fetchone()
+
+    return row[0] if row else 0
+
+
+def create_db_backup(dest_dir: Path) -> Path:
+    backup_path = dest_dir / f"messages-backup-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.sqlite3"
+
+    source = sqlite3.connect(DB_PATH)
+    try:
+        target = sqlite3.connect(backup_path)
+        try:
+            source.backup(target)
+        finally:
+            target.close()
+    finally:
+        source.close()
+
+    return backup_path
+
+
+async def send_db_backup(bot: Bot) -> None:
+    backup_chat_id = get_backup_chat_id()
+    if backup_chat_id is None:
+        raise RuntimeError("BACKUP_CHAT_ID is empty")
+
+    with tempfile.TemporaryDirectory(prefix="rat-bot-backup-") as tmp_dir:
+        backup_path = create_db_backup(Path(tmp_dir))
+        messages_count = count_all_messages()
+        file_size = backup_path.stat().st_size
+        backup_datetime = datetime.now(get_app_timezone())
+
+        with backup_path.open("rb") as backup_file:
+            await bot.send_document(
+                chat_id=backup_chat_id,
+                document=backup_file,
+                filename=backup_path.name,
+                caption=f"Бэкап базы от {backup_datetime:%Y-%m-%d %H:%M}, сообщений: {messages_count}",
+            )
+
+    logger.info(
+        "backup sent chat_id=%s size_bytes=%s messages_count=%s",
+        backup_chat_id,
+        file_size,
+        messages_count,
+    )
+
+
+async def send_scheduled_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await send_db_backup(context.bot)
+    except Exception:
+        logger.exception("автобэкап: не удалось отправить бэкап базы")
+
+
+async def handle_backup_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is not None and chat.id != allowed_chat_id:
+        logger.info("/backup ignored from chat_id=%s", chat.id)
+        return
+
+    try:
+        await send_db_backup(context.bot)
+    except Exception:
+        logger.exception("/backup: не удалось отправить бэкап базы")
+        await message.reply_text(
+            "Не смог отправить бэкап. Проверьте, что бот состоит в целевом чате "
+            "(BACKUP_CHAT_ID) и имеет там права отправлять сообщения."
+        )
+        return
+
+    await message.reply_text("Бэкап базы отправлен.")
+
+
 async def post_init(application: Application) -> None:
     await application.bot.set_my_commands(
         [BotCommand(name, description) for name, description in BOT_COMMANDS]
@@ -1467,6 +1580,7 @@ def main() -> None:
     application.add_handler(CommandHandler("roast", handle_roast_command))
     application.add_handler(CommandHandler("votekick", handle_votekick_command))
     application.add_handler(CommandHandler("horoscope", handle_horoscope_command))
+    application.add_handler(CommandHandler("backup", handle_backup_command))
     application.add_handler(
         CallbackQueryHandler(handle_votekick_callback, pattern=r"^votekick:")
     )
@@ -1486,6 +1600,18 @@ def main() -> None:
             "автосводка не запланирована: CHAT_ID=%s DIGEST_TIME=%s",
             allowed_chat_id,
             os.getenv("DIGEST_TIME", ""),
+        )
+
+    backup_chat_id = get_backup_chat_id()
+    backup_time = get_backup_time(tz)
+    if backup_chat_id is not None and backup_time is not None:
+        application.job_queue.run_daily(send_scheduled_backup, time=backup_time, name="daily_backup")
+        logger.info("автобэкап запланирован на %s (%s)", backup_time, tz)
+    else:
+        logger.warning(
+            "автобэкап не запланирован: BACKUP_CHAT_ID=%s BACKUP_TIME=%s",
+            backup_chat_id,
+            os.getenv("BACKUP_TIME", ""),
         )
 
     logger.info("bot started")
