@@ -268,6 +268,7 @@ SLANG_INSTRUCTION_TEMPLATE = (
     "по контексту и духу фразы — это придаёт узнаваемость. "
     "Не переусердствуй и не используй через слово."
 )
+RECENT_GENERATED_TEXTS_LIMIT = 8
 
 NO_CLICHES_INSTRUCTION = (
     "Избегай клише и шаблонных фраз вроде 'легендарный', 'спокойная совесть', 'триумф' — вместо этого "
@@ -852,6 +853,57 @@ def build_character_intro(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> s
     return f"{RAT_CHARACTER_INTRO}\n{slang_instruction}"
 
 
+def get_recent_generated_texts(
+    context: ContextTypes.DEFAULT_TYPE,
+    storage_key: str,
+    chat_id: int,
+) -> list[str]:
+    recent_by_chat: dict[int, list[str]] = context.application.bot_data.setdefault(
+        storage_key, {}
+    )
+    return list(recent_by_chat.get(chat_id, []))
+
+
+def remember_generated_text(
+    context: ContextTypes.DEFAULT_TYPE,
+    storage_key: str,
+    chat_id: int,
+    text: str,
+) -> None:
+    cleaned_text = " ".join(text.split())
+    if not cleaned_text:
+        return
+
+    recent_by_chat: dict[int, list[str]] = context.application.bot_data.setdefault(
+        storage_key, {}
+    )
+    recent = recent_by_chat.setdefault(chat_id, [])
+    recent.append(cleaned_text)
+    recent_by_chat[chat_id] = recent[-RECENT_GENERATED_TEXTS_LIMIT:]
+
+
+def format_recent_rat_replies_instruction(recent_replies: list[str]) -> str:
+    if not recent_replies:
+        return ""
+
+    return (
+        "\n\nВот твои последние ответы на упоминание 'крысы' в этом чате: "
+        f"{' | '.join(recent_replies)}. "
+        "НЕ повторяй эти формулировки, образы и структуру фраз — придумай принципиально новый ракурс шутки."
+    )
+
+
+def format_recent_roasts_instruction(recent_roasts: list[str]) -> str:
+    if not recent_roasts:
+        return ""
+
+    return (
+        "\n\nВот твои последние roast-подколы в этом чате: "
+        f"{' | '.join(recent_roasts)}. "
+        "НЕ повторяй эти формулировки, образы и структуру фраз — придумай новый ракурс подкола."
+    )
+
+
 def get_author_name(row: sqlite3.Row, name_map: dict[str, str]) -> str:
     username = row["username"]
     if username:
@@ -1258,7 +1310,12 @@ async def maybe_reply_to_rat_mention(
     chat_id = message.chat_id
 
     character_intro = build_character_intro(context, chat_id)
-    prompt = RAT_REPLY_PROMPT_TEMPLATE.format(character_intro=character_intro, text=text)
+    recent_replies = get_recent_generated_texts(context, "recent_rat_replies", chat_id)
+    prompt = RAT_REPLY_PROMPT_TEMPLATE.format(
+        character_intro=character_intro,
+        text=text,
+    )
+    prompt += format_recent_rat_replies_instruction(recent_replies)
     try:
         reply = await generate_gemini_text(prompt)
     except Exception:
@@ -1266,6 +1323,7 @@ async def maybe_reply_to_rat_mention(
         return False
 
     await message.reply_text(reply)
+    remember_generated_text(context, "recent_rat_replies", chat_id, reply)
     logger.info("rat mention triggered text=%r reply=%r", text[:120], reply[:120])
     return True
 
@@ -2024,11 +2082,13 @@ async def handle_roast_command(
     lines = [row["text"].strip() for row in rows if row["text"] and row["text"].strip()]
     messages_text = "\n".join(f"- {line}" for line in lines)
     character_intro = build_character_intro(context, allowed_chat_id)
+    recent_roasts = get_recent_generated_texts(context, "recent_roast_replies", allowed_chat_id)
     prompt = ROAST_PROMPT_TEMPLATE.format(
         character_intro=character_intro,
         name=display_name,
         messages=messages_text,
     )
+    prompt += format_recent_roasts_instruction(recent_roasts)
 
     try:
         roast_text = await generate_gemini_text(prompt)
@@ -2039,6 +2099,7 @@ async def handle_roast_command(
 
     roast_last_at[roast_key] = now
     await message.reply_text(roast_text)
+    remember_generated_text(context, "recent_roast_replies", allowed_chat_id, roast_text)
     logger.info(
         "/roast target_user_id=%s target_username=%s messages_count=%s success",
         target_user_id,

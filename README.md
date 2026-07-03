@@ -14,6 +14,7 @@ Telegram-бот на Python, который сохраняет сообщени�
 - команды `/digest`, `/weekly`, `/roast`, `/votekick`, `/horoscope`, `/morning`, `/backup`;
 - команда `/stats` для мгновенной статистики по сохраненным данным без Gemini;
 - реакция на упоминание слова "крыса" через общий образ персонажа и сленг чата;
+- in-memory память последних сгенерированных ответов для реакции на "крысу" и `/roast`, чтобы снижать повторы;
 - хранение базы и логов на хосте через Docker volume mounts.
 
 ## Структура проекта
@@ -60,7 +61,7 @@ CHAT_ID=
 DIGEST_TIME=21:00
 TZ=Europe/Moscow
 ROAST_COOLDOWN_MINUTES=10
-ROAST_LOOKBACK_DAYS=7
+ROAST_LOOKBACK_DAYS=14
 VOTEKICK_COOLDOWN_MINUTES=15
 VOTEKICK_DURATION_MINUTES=5
 NONSENSE_CHAIN_REFRESH_MINUTES=60
