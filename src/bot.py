@@ -41,6 +41,7 @@ BOT_COMMANDS = [
     ("roast", "Подколоть друга по его сообщениям: /roast @username"),
     ("votekick", "Шуточное голосование за изгнание из чата"),
     ("horoscope", "Гороскоп чата на завтра"),
+    ("weekly", "Дайджест недели (обычно по пятницам)"),
     ("backup", "Сделать бэкап базы прямо сейчас"),
 ]
 
@@ -104,6 +105,21 @@ HOROSCOPE_PROMPT_TEMPLATE = (
     "в чате, если это уместно. Без оскорблений и перехода на личности.\n"
     "Верни СТРОГО валидный JSON без markdown, формат:\n"
     '{{"horoscopes": [{{"name": "Имя", "forecast": "текст прогноза"}}]}}\n\n'
+    + NO_CLICHES_INSTRUCTION
+)
+
+WEEKLY_DIGEST_PROMPT_TEMPLATE = (
+    RAT_CHARACTER_INTRO + "\n"
+    "На основе сводок дня за неделю напиши пятничный дайджест недели.\n"
+    "Вот дневные сводки за неделю:\n"
+    "{days}\n\n"
+    "Структура ответа — строго валидный JSON, без markdown-обёртки:\n"
+    '{{"weekly_summary": "развёрнутый пересказ недели, 3-5 предложений, подмечающий повторяющиеся темы и тренды", '
+    '"week_quote_text": "лучшая цитата недели, выбранная среди дневных цитат, дословно", '
+    '"week_quote_author": "автор этой цитаты", '
+    '"person_of_week": {{"name": "имя", "reason": "короткое обоснование, почему именно этот человек — герой '
+    'недели, на основе того, как часто и как он фигурировал в дневных номинациях и цитатах"}}}}\n\n'
+    "Верни только JSON, без markdown.\n"
     + NO_CLICHES_INSTRUCTION
 )
 
@@ -194,6 +210,22 @@ def get_backup_time(tz: ZoneInfo) -> time | None:
             raise ValueError
     except ValueError as exc:
         raise RuntimeError(f"BACKUP_TIME must be in HH:MM format, got {raw!r}") from exc
+
+    return time(hour=hour, minute=minute, tzinfo=tz)
+
+
+def get_weekly_digest_time(tz: ZoneInfo) -> time | None:
+    raw = os.getenv("WEEKLY_DIGEST_TIME", "").strip()
+    if not raw:
+        return None
+
+    try:
+        hour_str, minute_str = raw.split(":", 1)
+        hour, minute = int(hour_str), int(minute_str)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError as exc:
+        raise RuntimeError(f"WEEKLY_DIGEST_TIME must be in HH:MM format, got {raw!r}") from exc
 
     return time(hour=hour, minute=minute, tzinfo=tz)
 
@@ -357,6 +389,21 @@ def init_db() -> None:
             """
         )
 
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS daily_digests (
+                chat_id INTEGER NOT NULL,
+                date TEXT NOT NULL,
+                intro TEXT,
+                quote_text TEXT,
+                quote_author TEXT,
+                nominations_json TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (chat_id, date)
+            )
+            """
+        )
+
         connection.commit()
 
 
@@ -516,6 +563,78 @@ def build_horoscope_request(
     transcript = build_messages_transcript(messages, name_map)
     topics = transcript if transcript else "ничего особенного"
     return HOROSCOPE_PROMPT_TEMPLATE.format(topics=topics, names=", ".join(names))
+
+
+def save_daily_digest(chat_id: int, date_str: str, digest_data: dict) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO daily_digests (
+                chat_id, date, intro, quote_text, quote_author, nominations_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                date_str,
+                str(digest_data.get("intro", "")).strip(),
+                str(digest_data.get("quote_text", "")).strip(),
+                str(digest_data.get("quote_author", "")).strip(),
+                json.dumps(digest_data.get("nominations") or [], ensure_ascii=False),
+            ),
+        )
+        connection.commit()
+
+    logger.info("daily digest saved to daily_digests chat_id=%s date=%s", chat_id, date_str)
+
+
+def fetch_weekly_digests(chat_id: int, tz: ZoneInfo) -> list[sqlite3.Row]:
+    today = datetime.now(tz).date()
+    start_date = (today - timedelta(days=6)).isoformat()
+    end_date = today.isoformat()
+
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            """
+            SELECT date, intro, quote_text, quote_author, nominations_json
+            FROM daily_digests
+            WHERE chat_id = ?
+              AND date >= ?
+              AND date <= ?
+            ORDER BY date ASC
+            """,
+            (chat_id, start_date, end_date),
+        ).fetchall()
+
+
+def build_weekly_digest(chat_id: int) -> str | None:
+    tz = get_app_timezone()
+    rows = fetch_weekly_digests(chat_id, tz)
+    logger.info("weekly digest: chat_id=%s daily digests found=%s", chat_id, len(rows))
+    if not rows:
+        return None
+
+    day_blocks = []
+    for row in rows:
+        try:
+            nominations = json.loads(row["nominations_json"]) if row["nominations_json"] else []
+        except (TypeError, ValueError):
+            nominations = []
+
+        nominations_text = "; ".join(
+            f"{nom.get('title', '')}: {nom.get('name', '')} — {nom.get('reason', '')}"
+            for nom in nominations
+        ) or "нет"
+
+        day_blocks.append(
+            f"Дата: {row['date']}\n"
+            f"Пересказ дня: {row['intro'] or ''}\n"
+            f"Цитата дня: \"{row['quote_text'] or ''}\" — {row['quote_author'] or ''}\n"
+            f"Номинации: {nominations_text}"
+        )
+
+    return WEEKLY_DIGEST_PROMPT_TEMPLATE.format(days="\n\n".join(day_blocks))
 
 
 def build_markov_chain(texts: list[str]) -> dict[tuple[str, str], list[str]]:
@@ -682,6 +801,30 @@ def format_horoscope_html(data: dict) -> str:
         name = escape_html(str(item.get("name", "")).strip())
         forecast = escape_html(str(item.get("forecast", "")).strip())
         lines.append(f"<b>{name}</b> — <i>{forecast}</i>")
+
+    return "\n".join(lines)
+
+
+def format_weekly_digest_html(data: dict) -> str:
+    weekly_summary = escape_html(str(data.get("weekly_summary", "")).strip())
+    quote_text = escape_html(str(data.get("week_quote_text", "")).strip())
+    quote_author = escape_html(str(data.get("week_quote_author", "")).strip())
+    person = data.get("person_of_week") or {}
+    person_name = escape_html(str(person.get("name", "")).strip())
+    person_reason = escape_html(str(person.get("reason", "")).strip())
+
+    lines = [
+        "📅 <b>Дайджест недели</b>",
+        "",
+        weekly_summary,
+        "",
+        "<b>Цитата недели:</b>",
+        f"<blockquote>{quote_text}</blockquote>",
+        f"<i>— {quote_author}</i>",
+        "",
+        "<b>Герой недели:</b>",
+        f"{person_name} — {person_reason}",
+    ]
 
     return "\n".join(lines)
 
@@ -1056,6 +1199,8 @@ async def handle_digest_command(
         logger.exception("failed to generate digest with Gemini")
         await message.reply_text("Не смог собрать сводку, попробуйте позже")
         return
+
+    save_daily_digest(allowed_chat_id, datetime.now(tz).date().isoformat(), digest_data)
 
     logger.info("/digest generated successfully chat_id=%s", allowed_chat_id)
     await message.reply_text(format_digest_html(digest_data), parse_mode="HTML")
@@ -1434,6 +1579,42 @@ async def handle_horoscope_command(
     await message.reply_text(format_horoscope_html(horoscope_data), parse_mode="HTML")
 
 
+async def handle_weekly_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None:
+        logger.warning("/weekly ignored because CHAT_ID is empty")
+        await message.reply_text("CHAT_ID не настроен, дайджест недели собрать не получится")
+        return
+
+    if chat.id != allowed_chat_id:
+        logger.info("/weekly ignored from chat_id=%s", chat.id)
+        return
+
+    prompt = build_weekly_digest(allowed_chat_id)
+    if prompt is None:
+        await message.reply_text("Пока не набралось сводок за неделю, рано подводить итоги")
+        return
+
+    try:
+        raw_weekly = await generate_gemini_text(prompt)
+        weekly_data = parse_digest_json(raw_weekly)
+    except Exception:
+        logger.exception("/weekly failed to generate")
+        await message.reply_text("Не смог собрать недельный дайджест, попробуйте позже")
+        return
+
+    logger.info("/weekly generated successfully chat_id=%s", allowed_chat_id)
+    await message.reply_text(format_weekly_digest_html(weekly_data), parse_mode="HTML")
+
+
 async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_chat_id = get_allowed_chat_id()
     if allowed_chat_id is None:
@@ -1457,6 +1638,8 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("автосводка: ошибка при обращении к Gemini")
         return
 
+    save_daily_digest(allowed_chat_id, datetime.now(tz).date().isoformat(), digest_data)
+
     await context.bot.send_message(
         chat_id=allowed_chat_id,
         text=format_digest_html(digest_data),
@@ -1467,6 +1650,32 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         allowed_chat_id,
         len(rows),
     )
+
+
+async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None:
+        logger.warning("недельный дайджест пропущен: CHAT_ID не настроен")
+        return
+
+    prompt = build_weekly_digest(allowed_chat_id)
+    if prompt is None:
+        logger.info("недельный дайджест пропущен: нет данных за неделю")
+        return
+
+    try:
+        raw_weekly = await generate_gemini_text(prompt)
+        weekly_data = parse_digest_json(raw_weekly)
+    except Exception:
+        logger.exception("недельный дайджест: ошибка при обращении к Gemini")
+        return
+
+    await context.bot.send_message(
+        chat_id=allowed_chat_id,
+        text=format_weekly_digest_html(weekly_data),
+        parse_mode="HTML",
+    )
+    logger.info("недельный дайджест отправлен chat_id=%s", allowed_chat_id)
 
 
 def count_all_messages() -> int:
@@ -1580,6 +1789,7 @@ def main() -> None:
     application.add_handler(CommandHandler("roast", handle_roast_command))
     application.add_handler(CommandHandler("votekick", handle_votekick_command))
     application.add_handler(CommandHandler("horoscope", handle_horoscope_command))
+    application.add_handler(CommandHandler("weekly", handle_weekly_command))
     application.add_handler(CommandHandler("backup", handle_backup_command))
     application.add_handler(
         CallbackQueryHandler(handle_votekick_callback, pattern=r"^votekick:")
@@ -1612,6 +1822,19 @@ def main() -> None:
             "автобэкап не запланирован: BACKUP_CHAT_ID=%s BACKUP_TIME=%s",
             backup_chat_id,
             os.getenv("BACKUP_TIME", ""),
+        )
+
+    weekly_digest_time = get_weekly_digest_time(tz)
+    if allowed_chat_id is not None and weekly_digest_time is not None:
+        application.job_queue.run_daily(
+            send_weekly_digest, time=weekly_digest_time, days=(4,), name="weekly_digest"
+        )
+        logger.info("недельный дайджест запланирован на пятницу %s (%s)", weekly_digest_time, tz)
+    else:
+        logger.warning(
+            "недельный дайджест не запланирован: CHAT_ID=%s WEEKLY_DIGEST_TIME=%s",
+            allowed_chat_id,
+            os.getenv("WEEKLY_DIGEST_TIME", ""),
         )
 
     logger.info("bot started")
