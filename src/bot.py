@@ -7,6 +7,7 @@ import re
 import sqlite3
 import tempfile
 import textwrap
+from collections import Counter, defaultdict
 from contextlib import closing
 from datetime import datetime, time, timedelta, timezone
 from io import BytesIO
@@ -42,12 +43,230 @@ BOT_COMMANDS = [
     ("votekick", "Шуточное голосование за изгнание из чата"),
     ("horoscope", "Гороскоп чата на завтра"),
     ("weekly", "Дайджест недели (обычно по пятницам)"),
+    ("stats", "Статистика чата: активность, топ участников"),
     ("backup", "Сделать бэкап базы прямо сейчас"),
+    ("morning", "Прислать утреннее приветствие (для теста)"),
 ]
 
 RAT_CHARACTER_INTRO = (
     "Ты — RAT, саркастичный, остроумный и слегка нахальный летописец дружеского чата. "
     "Ты подмечаешь конкретные детали и цепляешься за них, а не отделываешься общими фразами."
+)
+
+RUSSIAN_STOP_WORDS = frozenset(
+    {
+        "а",
+        "без",
+        "более",
+        "больше",
+        "будет",
+        "будто",
+        "бы",
+        "был",
+        "была",
+        "были",
+        "было",
+        "бот",
+        "бота",
+        "боту",
+        "быть",
+        "в",
+        "вам",
+        "вас",
+        "ваш",
+        "ведь",
+        "весь",
+        "во",
+        "вообще",
+        "вот",
+        "все",
+        "всегда",
+        "всего",
+        "всем",
+        "всех",
+        "всю",
+        "вся",
+        "всё",
+        "где",
+        "да",
+        "даже",
+        "для",
+        "до",
+        "его",
+        "ее",
+        "ей",
+        "ему",
+        "если",
+        "есть",
+        "еще",
+        "ещё",
+        "её",
+        "же",
+        "за",
+        "здесь",
+        "и",
+        "из",
+        "или",
+        "им",
+        "их",
+        "к",
+        "как",
+        "какая",
+        "какие",
+        "каким",
+        "какое",
+        "какой",
+        "когда",
+        "кого",
+        "конечно",
+        "короче",
+        "который",
+        "куда",
+        "ли",
+        "лучше",
+        "меня",
+        "мне",
+        "мной",
+        "мог",
+        "могла",
+        "могли",
+        "могу",
+        "могут",
+        "мой",
+        "может",
+        "можете",
+        "можешь",
+        "можно",
+        "моя",
+        "мы",
+        "на",
+        "над",
+        "надо",
+        "нам",
+        "нас",
+        "наш",
+        "не",
+        "него",
+        "нее",
+        "ней",
+        "нельзя",
+        "нем",
+        "нему",
+        "нет",
+        "неё",
+        "ни",
+        "них",
+        "ничего",
+        "но",
+        "ну",
+        "нужно",
+        "о",
+        "об",
+        "один",
+        "одна",
+        "одно",
+        "он",
+        "она",
+        "они",
+        "оно",
+        "от",
+        "очень",
+        "по",
+        "под",
+        "пока",
+        "после",
+        "потом",
+        "потому",
+        "почти",
+        "при",
+        "про",
+        "просто",
+        "пусть",
+        "раз",
+        "с",
+        "сам",
+        "сама",
+        "сами",
+        "самый",
+        "свое",
+        "свои",
+        "свой",
+        "себе",
+        "себя",
+        "сейчас",
+        "сказал",
+        "сказала",
+        "сказать",
+        "со",
+        "совсем",
+        "так",
+        "такая",
+        "такие",
+        "таким",
+        "такое",
+        "такой",
+        "там",
+        "тебе",
+        "тебя",
+        "тем",
+        "теперь",
+        "то",
+        "тобой",
+        "тогда",
+        "того",
+        "тоже",
+        "только",
+        "том",
+        "тому",
+        "тот",
+        "тут",
+        "ты",
+        "у",
+        "уже",
+        "хоть",
+        "хотя",
+        "хочу",
+        "хочешь",
+        "хотел",
+        "хотела",
+        "хотели",
+        "хотеть",
+        "чего",
+        "чем",
+        "через",
+        "чат",
+        "чата",
+        "чате",
+        "чату",
+        "что",
+        "чтоб",
+        "чтобы",
+        "эта",
+        "эти",
+        "этим",
+        "этих",
+        "это",
+        "этого",
+        "этой",
+        "этом",
+        "этому",
+        "этот",
+        "эту",
+        "я",
+    }
+)
+
+SLANG_WORD_PATTERN = re.compile(r"[a-zа-яё]+", re.IGNORECASE)
+SLANG_LOOKBACK_DAYS = 30
+SLANG_MIN_WORD_LENGTH = 4
+SLANG_MIN_USERS = 2
+SLANG_MIN_TOTAL_COUNT = 5
+SLANG_TOP_LIMIT = 15
+SLANG_INSTRUCTION_TEMPLATE = (
+    "В этом чате часто используют такие словечки: {words}. "
+    "Изредка, не в каждом ответе, можешь естественно ввернуть одно из них, если это уместно "
+    "по контексту и духу фразы — это придаёт узнаваемость. "
+    "Не переусердствуй и не используй через слово."
 )
 
 NO_CLICHES_INSTRUCTION = (
@@ -56,7 +275,7 @@ NO_CLICHES_INSTRUCTION = (
     "Чем конкретнее и неожиданнее шутка — тем лучше."
 )
 
-DIGEST_PROMPT = f"""{RAT_CHARACTER_INTRO}
+DIGEST_PROMPT_TEMPLATE = """{character_intro}
 На основе сообщений за день собери саркастичную сводку.
 Сарказм — да, но по-доброму, без оскорблений, без перехода на личности, без токсичности по внешности, здоровью, национальности и подобным болезненным темам.
 
@@ -72,21 +291,24 @@ DIGEST_PROMPT = f"""{RAT_CHARACTER_INTRO}
 
 В "nominations" верни 2-3 объекта. Обращайся к людям по именам. Пиши на русском. Не выдумывай сообщений, которых не было.
 
-{NO_CLICHES_INSTRUCTION}
+{no_cliches_instruction}
 """
 
 RAT_MENTION_PATTERN = re.compile(r"\bкрыс[а-яё]*\b", re.IGNORECASE)
 
 RAT_REPLY_PROMPT_TEMPLATE = (
-    "Ты — саркастичный, но добрый бот по имени RAT в дружеском Telegram-чате. "
+    "{character_intro}\n"
     "Кто-то в чате только что упомянул слово 'крыса' (в каком-то виде) в сообщении: '{text}'. "
-    "Придумай короткий остроумный ответ на 1-2 предложения, обыгрывающий это упоминание "
-    "в шуточной саркастичной манере. Без оскорблений, без перехода на личности. "
+    "Придумай короткий ОСТРЫЙ саркастичный ответ на 1-2 предложения — задиристый, "
+    "с подколом, не дружелюбный и не мягкий, а именно колкий и дерзкий. "
+    "Обыграй упоминание слова с иронией. Без реальных оскорблений, без перехода "
+    "на личности, без токсичности по внешности/здоровью/национальности — но тон "
+    "должен быть язвительным, а не приветливым. "
     "Ответь только текстом реплики, без кавычек и пояснений."
 )
 
 ROAST_PROMPT_TEMPLATE = (
-    RAT_CHARACTER_INTRO + "\n"
+    "{character_intro}\n"
     "Вот реальные сообщения человека по имени {name} за последнее время:\n"
     "{messages}\n"
     "Придумай короткий дружеский roast (подкол) на основе ЭТИХ РЕАЛЬНЫХ сообщений, 2-4 предложения. "
@@ -97,7 +319,7 @@ ROAST_PROMPT_TEMPLATE = (
 )
 
 HOROSCOPE_PROMPT_TEMPLATE = (
-    RAT_CHARACTER_INTRO + "\n"
+    "{character_intro}\n"
     "Сегодня в чате обсуждали (кратко): {topics}.\n"
     "Придумай шуточный гороскоп на завтра для каждого из следующих людей: {names}.\n"
     "Каждый прогноз — 1 короткое ироничное предложение, в шуточно-астрологическом стиле "
@@ -109,7 +331,7 @@ HOROSCOPE_PROMPT_TEMPLATE = (
 )
 
 WEEKLY_DIGEST_PROMPT_TEMPLATE = (
-    RAT_CHARACTER_INTRO + "\n"
+    "{character_intro}\n"
     "На основе сводок дня за неделю напиши пятничный дайджест недели.\n"
     "Вот дневные сводки за неделю:\n"
     "{days}\n\n"
@@ -126,7 +348,7 @@ WEEKLY_DIGEST_PROMPT_TEMPLATE = (
 VOTEKICK_KICK_THRESHOLD = 5
 
 VOTEKICK_KICKED_PROMPT_TEMPLATE = (
-    RAT_CHARACTER_INTRO + "\n"
+    "{character_intro}\n"
     "По итогам голосования чат решил шуточно «выгнать» {name} из чата "
     "(голоса: {kick_count} за, {spare_count} против). "
     "Напиши короткое смешное прощание/эпитафию, 2-3 предложения, в саркастичном, но добром тоне, "
@@ -135,7 +357,7 @@ VOTEKICK_KICKED_PROMPT_TEMPLATE = (
 )
 
 VOTEKICK_SPARED_PROMPT_TEMPLATE = (
-    RAT_CHARACTER_INTRO + "\n"
+    "{character_intro}\n"
     "Голосование за изгнание {name} не набрало нужного числа голосов "
     "(голоса: {kick_count} за, {spare_count} против) — чат смилостивился, {name} остаётся в чате. "
     "Придумай короткий саркастичный комментарий по этому поводу, 2-3 предложения, в добром тоне, "
@@ -230,14 +452,20 @@ def get_weekly_digest_time(tz: ZoneInfo) -> time | None:
     return time(hour=hour, minute=minute, tzinfo=tz)
 
 
-def get_rat_reply_cooldown() -> timedelta:
-    raw = os.getenv("RAT_REPLY_COOLDOWN_MINUTES", "7").strip()
-    try:
-        minutes = float(raw)
-    except ValueError:
-        minutes = 7.0
+def get_morning_greeting_time(tz: ZoneInfo) -> time | None:
+    raw = os.getenv("MORNING_GREETING_TIME", "").strip()
+    if not raw:
+        return None
 
-    return timedelta(minutes=minutes)
+    try:
+        hour_str, minute_str = raw.split(":", 1)
+        hour, minute = int(hour_str), int(minute_str)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError as exc:
+        raise RuntimeError(f"MORNING_GREETING_TIME must be in HH:MM format, got {raw!r}") from exc
+
+    return time(hour=hour, minute=minute, tzinfo=tz)
 
 
 def get_roast_cooldown() -> timedelta:
@@ -248,6 +476,19 @@ def get_roast_cooldown() -> timedelta:
         minutes = 10.0
 
     return timedelta(minutes=minutes)
+
+
+def get_roast_lookback_days() -> int:
+    raw = os.getenv("ROAST_LOOKBACK_DAYS", "7").strip()
+    try:
+        days = int(raw)
+    except ValueError:
+        days = 7
+
+    if days <= 0:
+        days = 7
+
+    return days
 
 
 def get_votekick_cooldown() -> timedelta:
@@ -312,6 +553,19 @@ def get_meme_render_chance() -> float:
         return float(raw)
     except ValueError:
         return 0.4
+
+
+def get_slang_refresh_interval() -> timedelta:
+    raw = os.getenv("SLANG_REFRESH_HOURS", "24").strip()
+    try:
+        hours = float(raw)
+    except ValueError:
+        hours = 24.0
+
+    if hours <= 0:
+        hours = 24.0
+
+    return timedelta(hours=hours)
 
 
 def get_app_timezone() -> ZoneInfo:
@@ -531,6 +785,73 @@ def fetch_all_chat_texts(chat_id: int) -> list[str]:
     return [row["text"] for row in rows if row["text"] and row["text"].strip()]
 
 
+def extract_chat_slang(chat_id: int) -> list[str]:
+    since_utc = (datetime.now(timezone.utc) - timedelta(days=SLANG_LOOKBACK_DAYS)).isoformat()
+
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT user_id, text
+            FROM messages
+            WHERE chat_id = ?
+              AND message_datetime >= ?
+              AND user_id IS NOT NULL
+              AND (is_bot IS NULL OR is_bot = 0)
+            """,
+            (chat_id, since_utc),
+        ).fetchall()
+
+    word_counts: Counter[str] = Counter()
+    word_users: defaultdict[str, set[int]] = defaultdict(set)
+
+    for row in rows:
+        text = row["text"]
+        user_id = row["user_id"]
+        if not text or user_id is None:
+            continue
+
+        for word in SLANG_WORD_PATTERN.findall(text.lower()):
+            if len(word) < SLANG_MIN_WORD_LENGTH or word in RUSSIAN_STOP_WORDS:
+                continue
+
+            word_counts[word] += 1
+            word_users[word].add(user_id)
+
+    candidates = [
+        (word, total_count)
+        for word, total_count in word_counts.items()
+        if total_count >= SLANG_MIN_TOTAL_COUNT and len(word_users[word]) >= SLANG_MIN_USERS
+    ]
+    candidates.sort(key=lambda item: (-item[1], item[0]))
+
+    return [word for word, _ in candidates[:SLANG_TOP_LIMIT]]
+
+
+def get_or_extract_chat_slang(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> list[str]:
+    cache: dict[int, dict] = context.application.bot_data.setdefault("chat_slang_cache", {})
+    now = datetime.now(timezone.utc)
+    refresh_interval = get_slang_refresh_interval()
+
+    cached = cache.get(chat_id)
+    if cached is not None and now - cached["built_at"] < refresh_interval:
+        return cached["words"]
+
+    words = extract_chat_slang(chat_id)
+    cache[chat_id] = {"words": words, "built_at": now}
+    logger.info("chat slang rebuilt chat_id=%s words=%s", chat_id, words)
+    return words
+
+
+def build_character_intro(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
+    slang_words = get_or_extract_chat_slang(context, chat_id)
+    if not slang_words:
+        return RAT_CHARACTER_INTRO
+
+    slang_instruction = SLANG_INSTRUCTION_TEMPLATE.format(words=", ".join(slang_words))
+    return f"{RAT_CHARACTER_INTRO}\n{slang_instruction}"
+
+
 def get_author_name(row: sqlite3.Row, name_map: dict[str, str]) -> str:
     username = row["username"]
     if username:
@@ -551,18 +872,29 @@ def build_messages_transcript(messages: list[sqlite3.Row], name_map: dict[str, s
     return "\n".join(lines)
 
 
-def build_digest_request(messages: list[sqlite3.Row], name_map: dict[str, str]) -> str:
-    return f"{DIGEST_PROMPT}\n\nСообщения за день:\n" + build_messages_transcript(messages, name_map)
+def build_digest_request(
+    messages: list[sqlite3.Row], name_map: dict[str, str], character_intro: str
+) -> str:
+    prompt = DIGEST_PROMPT_TEMPLATE.format(
+        character_intro=character_intro,
+        no_cliches_instruction=NO_CLICHES_INSTRUCTION,
+    )
+    return f"{prompt}\n\nСообщения за день:\n" + build_messages_transcript(messages, name_map)
 
 
 def build_horoscope_request(
     messages: list[sqlite3.Row],
     name_map: dict[str, str],
     names: list[str],
+    character_intro: str,
 ) -> str:
     transcript = build_messages_transcript(messages, name_map)
     topics = transcript if transcript else "ничего особенного"
-    return HOROSCOPE_PROMPT_TEMPLATE.format(topics=topics, names=", ".join(names))
+    return HOROSCOPE_PROMPT_TEMPLATE.format(
+        character_intro=character_intro,
+        topics=topics,
+        names=", ".join(names),
+    )
 
 
 def save_daily_digest(chat_id: int, date_str: str, digest_data: dict) -> None:
@@ -608,7 +940,7 @@ def fetch_weekly_digests(chat_id: int, tz: ZoneInfo) -> list[sqlite3.Row]:
         ).fetchall()
 
 
-def build_weekly_digest(chat_id: int) -> str | None:
+def build_weekly_digest(chat_id: int, character_intro: str) -> str | None:
     tz = get_app_timezone()
     rows = fetch_weekly_digests(chat_id, tz)
     logger.info("weekly digest: chat_id=%s daily digests found=%s", chat_id, len(rows))
@@ -634,7 +966,10 @@ def build_weekly_digest(chat_id: int) -> str | None:
             f"Номинации: {nominations_text}"
         )
 
-    return WEEKLY_DIGEST_PROMPT_TEMPLATE.format(days="\n\n".join(day_blocks))
+    return WEEKLY_DIGEST_PROMPT_TEMPLATE.format(
+        character_intro=character_intro,
+        days="\n\n".join(day_blocks),
+    )
 
 
 def build_markov_chain(texts: list[str]) -> dict[tuple[str, str], list[str]]:
@@ -846,6 +1181,68 @@ def build_votekick_text(target_name: str, votes: dict[int, str]) -> str:
     return f"🔪 Голосование: выгоняем {target_name} из чата?\n\nЗа: {kick_count} | Против: {spare_count}"
 
 
+def build_morning_keyboard(count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"➕ {count}", callback_data="morning:react")]]
+    )
+
+
+def prune_morning_reactions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    reactions: dict[int, set[int]] = context.application.bot_data.setdefault(
+        "morning_reactions", {}
+    )
+    created_at_by_message: dict[int, datetime] = context.application.bot_data.setdefault(
+        "morning_reaction_created_at", {}
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+
+    expired_message_ids = [
+        message_id
+        for message_id, created_at in created_at_by_message.items()
+        if created_at < cutoff
+    ]
+    for message_id in expired_message_ids:
+        reactions.pop(message_id, None)
+        created_at_by_message.pop(message_id, None)
+
+
+async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE, source: str) -> None:
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None:
+        logger.warning("утреннее приветствие пропущено: CHAT_ID не настроен")
+        return
+
+    prune_morning_reactions(context)
+    sent_message = await context.bot.send_message(
+        chat_id=allowed_chat_id,
+        text="Доброе утро всем! ☀️",
+        reply_markup=build_morning_keyboard(0),
+    )
+
+    reactions: dict[int, set[int]] = context.application.bot_data.setdefault(
+        "morning_reactions", {}
+    )
+    created_at_by_message: dict[int, datetime] = context.application.bot_data.setdefault(
+        "morning_reaction_created_at", {}
+    )
+    reactions[sent_message.message_id] = set()
+    created_at_by_message[sent_message.message_id] = datetime.now(timezone.utc)
+
+    logger.info(
+        "morning greeting sent source=%s chat_id=%s message_id=%s",
+        source,
+        allowed_chat_id,
+        sent_message.message_id,
+    )
+
+
+async def send_scheduled_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
+    try:
+        await send_morning_greeting(context, source="scheduled")
+    except Exception:
+        logger.exception("утреннее приветствие: не удалось отправить сообщение")
+
+
 async def maybe_reply_to_rat_mention(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -858,24 +1255,16 @@ async def maybe_reply_to_rat_mention(
     if author is not None and author.is_bot:
         return False
 
-    last_triggered_at: dict[int, datetime] = context.application.bot_data.setdefault(
-        "rat_reply_last_at", {}
-    )
     chat_id = message.chat_id
-    now = datetime.now(timezone.utc)
-    cooldown = get_rat_reply_cooldown()
-    previous = last_triggered_at.get(chat_id)
-    if previous is not None and now - previous < cooldown:
-        return False
 
-    prompt = RAT_REPLY_PROMPT_TEMPLATE.format(text=text)
+    character_intro = build_character_intro(context, chat_id)
+    prompt = RAT_REPLY_PROMPT_TEMPLATE.format(character_intro=character_intro, text=text)
     try:
         reply = await generate_gemini_text(prompt)
     except Exception:
         logger.exception("rat mention reply: Gemini error")
         return False
 
-    last_triggered_at[chat_id] = now
     await message.reply_text(reply)
     logger.info("rat mention triggered text=%r reply=%r", text[:120], reply[:120])
     return True
@@ -1048,6 +1437,292 @@ def fetch_random_photo_media(chat_id: int) -> sqlite3.Row | None:
         ).fetchone()
 
 
+def parse_db_datetime(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def resolve_display_name(
+    *,
+    user_id: int | None,
+    username: str | None,
+    display_name: str | None,
+    name_map: dict[str, str],
+) -> str:
+    if username:
+        mapped_name = name_map.get(username.lower())
+        if mapped_name:
+            return mapped_name
+
+    return display_name or username or f"user_{user_id}"
+
+
+def format_quiet_duration(duration: timedelta) -> str:
+    total_seconds = max(0, int(duration.total_seconds()))
+    days, remainder = divmod(total_seconds, 24 * 60 * 60)
+    hours, remainder = divmod(remainder, 60 * 60)
+    minutes = remainder // 60
+
+    if days:
+        return f"{days} дн. {hours} ч."
+    if hours:
+        return f"{hours} ч. {minutes} мин."
+    return f"{minutes} мин."
+
+
+def fetch_chat_stats(chat_id: int, tz: ZoneInfo, name_map: dict[str, str]) -> dict:
+    today_start_utc, today_end_utc = get_today_bounds_utc(tz)
+    seven_days_ago_utc = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    non_bot_clause = "(is_bot IS NULL OR is_bot = 0)"
+
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.row_factory = sqlite3.Row
+
+        total_messages = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM messages
+            WHERE chat_id = ?
+              AND {non_bot_clause}
+            """,
+            (chat_id,),
+        ).fetchone()[0]
+
+        today_messages = connection.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM messages
+            WHERE chat_id = ?
+              AND message_datetime >= ?
+              AND message_datetime <= ?
+              AND {non_bot_clause}
+            """,
+            (chat_id, today_start_utc, today_end_utc),
+        ).fetchone()[0]
+
+        recent_rows = connection.execute(
+            f"""
+            SELECT user_id, username, display_name
+            FROM messages
+            WHERE chat_id = ?
+              AND message_datetime >= ?
+              AND user_id IS NOT NULL
+              AND {non_bot_clause}
+            ORDER BY message_datetime DESC, message_id DESC
+            """,
+            (chat_id, seven_days_ago_utc),
+        ).fetchall()
+
+        all_message_datetimes = connection.execute(
+            f"""
+            SELECT message_datetime
+            FROM messages
+            WHERE chat_id = ?
+              AND {non_bot_clause}
+            """,
+            (chat_id,),
+        ).fetchall()
+
+        media_rows = connection.execute(
+            """
+            SELECT media_type, COUNT(*) AS media_count
+            FROM media
+            WHERE chat_id = ?
+              AND media_type IN ('photo', 'sticker')
+            GROUP BY media_type
+            """,
+            (chat_id,),
+        ).fetchall()
+
+        quiet_candidates = []
+        if name_map:
+            username_keys = list(name_map)
+            placeholders = ",".join("?" for _ in username_keys)
+            username_rows = connection.execute(
+                f"""
+                SELECT lower(username) AS username_key, user_id
+                FROM messages
+                WHERE chat_id = ?
+                  AND username IS NOT NULL
+                  AND lower(username) IN ({placeholders})
+                  AND user_id IS NOT NULL
+                  AND {non_bot_clause}
+                ORDER BY message_datetime DESC, message_id DESC
+                """,
+                [chat_id, *username_keys],
+            ).fetchall()
+
+            user_id_by_username: dict[str, int] = {}
+            for row in username_rows:
+                user_id_by_username.setdefault(row["username_key"], row["user_id"])
+
+            user_ids = sorted(set(user_id_by_username.values()))
+            last_message_by_user_id: dict[int, str] = {}
+            if user_ids:
+                user_id_placeholders = ",".join("?" for _ in user_ids)
+                last_message_rows = connection.execute(
+                    f"""
+                    SELECT user_id, MAX(message_datetime) AS last_message_datetime
+                    FROM messages
+                    WHERE chat_id = ?
+                      AND user_id IN ({user_id_placeholders})
+                      AND {non_bot_clause}
+                    GROUP BY user_id
+                    """,
+                    [chat_id, *user_ids],
+                ).fetchall()
+                last_message_by_user_id = {
+                    row["user_id"]: row["last_message_datetime"] for row in last_message_rows
+                }
+
+            now_utc = datetime.now(timezone.utc)
+            for username, name in name_map.items():
+                user_id = user_id_by_username.get(username)
+                if user_id is None:
+                    quiet_candidates.append(
+                        {
+                            "name": name,
+                            "user_id": None,
+                            "last_message_datetime": None,
+                            "silence": None,
+                        }
+                    )
+                    continue
+
+                last_message_datetime = last_message_by_user_id.get(user_id)
+                silence = (
+                    now_utc - parse_db_datetime(last_message_datetime).astimezone(timezone.utc)
+                    if last_message_datetime
+                    else None
+                )
+                quiet_candidates.append(
+                    {
+                        "name": name,
+                        "user_id": user_id,
+                        "last_message_datetime": last_message_datetime,
+                        "silence": silence,
+                    }
+                )
+
+    recent_counts: Counter[int] = Counter()
+    latest_recent_user: dict[int, sqlite3.Row] = {}
+    for row in recent_rows:
+        user_id = row["user_id"]
+        recent_counts[user_id] += 1
+        latest_recent_user.setdefault(user_id, row)
+
+    top_users = []
+    for user_id, count in recent_counts.most_common(5):
+        row = latest_recent_user[user_id]
+        top_users.append(
+            {
+                "name": resolve_display_name(
+                    user_id=user_id,
+                    username=row["username"],
+                    display_name=row["display_name"],
+                    name_map=name_map,
+                ),
+                "count": count,
+            }
+        )
+
+    hour_counts: Counter[int] = Counter()
+    for row in all_message_datetimes:
+        local_datetime = parse_db_datetime(row["message_datetime"]).astimezone(tz)
+        hour_counts[local_datetime.hour] += 1
+
+    peak_hour = None
+    if hour_counts:
+        peak_hour, peak_count = min(
+            hour_counts.items(),
+            key=lambda item: (-item[1], item[0]),
+        )
+    else:
+        peak_count = 0
+
+    quiet_person = None
+    if quiet_candidates:
+        never_written = [
+            candidate
+            for candidate in quiet_candidates
+            if candidate["last_message_datetime"] is None
+        ]
+        if never_written:
+            quiet_person = never_written[0]
+        else:
+            quiet_person = max(
+                quiet_candidates,
+                key=lambda candidate: candidate["silence"] or timedelta(0),
+            )
+
+    media_counts = {"photo": 0, "sticker": 0}
+    for row in media_rows:
+        media_counts[row["media_type"]] = row["media_count"]
+
+    return {
+        "total_messages": total_messages,
+        "today_messages": today_messages,
+        "top_users": top_users,
+        "quiet_person": quiet_person,
+        "peak_hour": peak_hour,
+        "peak_count": peak_count,
+        "media_counts": media_counts,
+    }
+
+
+def format_stats_html(stats: dict, tz: ZoneInfo) -> str:
+    top_users = stats["top_users"]
+    if top_users:
+        top_lines = [
+            f"{index}. {escape_html(user['name'])} — {user['count']}"
+            for index, user in enumerate(top_users, 1)
+        ]
+        top_text = "\n".join(top_lines)
+    else:
+        top_text = "нет сообщений за последние 7 дней"
+
+    quiet_person = stats["quiet_person"]
+    if quiet_person is None:
+        quiet_text = "словарик имён пуст"
+    elif quiet_person["last_message_datetime"] is None:
+        quiet_text = f"{escape_html(quiet_person['name'])} — не писал(а) ни разу"
+    else:
+        last_local = parse_db_datetime(quiet_person["last_message_datetime"]).astimezone(tz)
+        quiet_text = (
+            f"{escape_html(quiet_person['name'])} — молчит "
+            f"{format_quiet_duration(quiet_person['silence'])}, "
+            f"последнее сообщение {last_local:%Y-%m-%d %H:%M}"
+        )
+
+    if stats["peak_hour"] is None:
+        peak_text = "нет данных"
+    else:
+        peak_text = f"{stats['peak_hour']:02d}:00 — {stats['peak_count']} сообщений"
+
+    media_counts = stats["media_counts"]
+    return "\n".join(
+        [
+            "📊 <b>Статистика чата</b>",
+            "",
+            f"💬 <b>Всего:</b> {stats['total_messages']} сообщений",
+            f"📅 <b>Сегодня:</b> {stats['today_messages']} сообщений",
+            "",
+            "🏆 <b>Топ-5 за 7 дней:</b>",
+            top_text,
+            "",
+            f"🦗 <b>Самый тихий:</b> {quiet_text}",
+            f"⏰ <b>Час пик:</b> {peak_text}",
+            (
+                "🖼 <b>Медиа:</b> "
+                f"фото — {media_counts['photo']}, "
+                f"стикеры — {media_counts['sticker']}"
+            ),
+        ]
+    )
+
+
 async def handle_text_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1190,7 +1865,8 @@ async def handle_digest_command(
         await message.reply_text("За сегодня сообщений нет. Даже сарказму не из чего вырасти.")
         return
 
-    prompt = build_digest_request(rows, name_map)
+    character_intro = build_character_intro(context, allowed_chat_id)
+    prompt = build_digest_request(rows, name_map, character_intro)
 
     try:
         raw_digest = await generate_gemini_text(prompt)
@@ -1204,6 +1880,59 @@ async def handle_digest_command(
 
     logger.info("/digest generated successfully chat_id=%s", allowed_chat_id)
     await message.reply_text(format_digest_html(digest_data), parse_mode="HTML")
+
+
+async def handle_stats_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if message is None or chat is None:
+        return
+
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is not None and chat.id != allowed_chat_id:
+        logger.info("/stats ignored from chat_id=%s", chat.id)
+        return
+
+    logger.info(
+        "/stats called chat_id=%s user_id=%s",
+        chat.id,
+        user.id if user else None,
+    )
+
+    tz = get_app_timezone()
+    name_map = context.application.bot_data.get("name_map", {})
+    stats = fetch_chat_stats(chat.id, tz, name_map)
+    await message.reply_text(format_stats_html(stats, tz), parse_mode="HTML")
+
+
+async def handle_morning_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None:
+        logger.warning("/morning ignored because CHAT_ID is empty")
+        await message.reply_text("CHAT_ID не настроен, утреннее приветствие отправить не получится")
+        return
+
+    if chat.id != allowed_chat_id:
+        logger.info("/morning ignored from chat_id=%s", chat.id)
+        return
+
+    try:
+        await send_morning_greeting(context, source="manual")
+    except Exception:
+        logger.exception("/morning failed to send greeting")
+        await message.reply_text("Не смог отправить утреннее приветствие, попробуйте позже")
 
 
 async def handle_roast_command(
@@ -1249,7 +1978,9 @@ async def handle_roast_command(
             )
             return
 
-    since_utc = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+    since_utc = (
+        datetime.now(timezone.utc) - timedelta(days=get_roast_lookback_days())
+    ).isoformat()
     rows = fetch_user_messages(
         allowed_chat_id, user_id=target_user_id, username=target_username, since_utc=since_utc
     )
@@ -1292,7 +2023,12 @@ async def handle_roast_command(
 
     lines = [row["text"].strip() for row in rows if row["text"] and row["text"].strip()]
     messages_text = "\n".join(f"- {line}" for line in lines)
-    prompt = ROAST_PROMPT_TEMPLATE.format(name=display_name, messages=messages_text)
+    character_intro = build_character_intro(context, allowed_chat_id)
+    prompt = ROAST_PROMPT_TEMPLATE.format(
+        character_intro=character_intro,
+        name=display_name,
+        messages=messages_text,
+    )
 
     try:
         roast_text = await generate_gemini_text(prompt)
@@ -1476,6 +2212,59 @@ async def handle_votekick_callback(
         await finish_votekick(context, chat.id)
 
 
+async def handle_morning_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is None or chat is None or query.message is None:
+        return
+
+    user = query.from_user
+    if user is None:
+        await query.answer()
+        return
+
+    prune_morning_reactions(context)
+    message_id = query.message.message_id
+    reactions: dict[int, set[int]] = context.application.bot_data.setdefault(
+        "morning_reactions", {}
+    )
+    created_at_by_message: dict[int, datetime] = context.application.bot_data.setdefault(
+        "morning_reaction_created_at", {}
+    )
+    reacted_user_ids = reactions.setdefault(message_id, set())
+    created_at_by_message.setdefault(message_id, datetime.now(timezone.utc))
+
+    if user.id in reacted_user_ids:
+        await query.answer("Уже отметились ✅")
+        return
+
+    reacted_user_ids.add(user.id)
+    await query.answer("Доброе утро! ☀️")
+
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat.id,
+            message_id=message_id,
+            reply_markup=build_morning_keyboard(len(reacted_user_ids)),
+        )
+    except Exception:
+        logger.exception(
+            "morning reaction: failed to update button chat_id=%s message_id=%s",
+            chat.id,
+            message_id,
+        )
+
+    logger.info(
+        "morning reaction added chat_id=%s message_id=%s user_id=%s",
+        chat.id,
+        message_id,
+        user.id,
+    )
+
+
 async def votekick_timeout_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = context.job.chat_id
     logger.info("/votekick timeout reached chat_id=%s", chat_id)
@@ -1506,13 +2295,20 @@ async def finish_votekick(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> N
     except Exception:
         logger.exception("/votekick failed to clear keyboard chat_id=%s", chat_id)
 
+    character_intro = build_character_intro(context, chat_id)
     if kicked:
         prompt = VOTEKICK_KICKED_PROMPT_TEMPLATE.format(
-            name=target_name, kick_count=kick_count, spare_count=spare_count
+            character_intro=character_intro,
+            name=target_name,
+            kick_count=kick_count,
+            spare_count=spare_count,
         )
     else:
         prompt = VOTEKICK_SPARED_PROMPT_TEMPLATE.format(
-            name=target_name, kick_count=kick_count, spare_count=spare_count
+            character_intro=character_intro,
+            name=target_name,
+            kick_count=kick_count,
+            spare_count=spare_count,
         )
 
     verdict = "кикнут" if kicked else "помилован"
@@ -1562,7 +2358,8 @@ async def handle_horoscope_command(
 
     tz = get_app_timezone()
     rows = fetch_today_messages(allowed_chat_id, tz)
-    prompt = build_horoscope_request(rows, name_map, names)
+    character_intro = build_character_intro(context, allowed_chat_id)
+    prompt = build_horoscope_request(rows, name_map, names, character_intro)
 
     try:
         raw_horoscope = await generate_gemini_text(prompt)
@@ -1598,7 +2395,8 @@ async def handle_weekly_command(
         logger.info("/weekly ignored from chat_id=%s", chat.id)
         return
 
-    prompt = build_weekly_digest(allowed_chat_id)
+    character_intro = build_character_intro(context, allowed_chat_id)
+    prompt = build_weekly_digest(allowed_chat_id, character_intro)
     if prompt is None:
         await message.reply_text("Пока не набралось сводок за неделю, рано подводить итоги")
         return
@@ -1629,7 +2427,8 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.info("автосводка пропущена: нет сообщений за день")
         return
 
-    prompt = build_digest_request(rows, name_map)
+    character_intro = build_character_intro(context, allowed_chat_id)
+    prompt = build_digest_request(rows, name_map, character_intro)
 
     try:
         raw_digest = await generate_gemini_text(prompt)
@@ -1658,7 +2457,8 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("недельный дайджест пропущен: CHAT_ID не настроен")
         return
 
-    prompt = build_weekly_digest(allowed_chat_id)
+    character_intro = build_character_intro(context, allowed_chat_id)
+    prompt = build_weekly_digest(allowed_chat_id, character_intro)
     if prompt is None:
         logger.info("недельный дайджест пропущен: нет данных за неделю")
         return
@@ -1790,9 +2590,14 @@ def main() -> None:
     application.add_handler(CommandHandler("votekick", handle_votekick_command))
     application.add_handler(CommandHandler("horoscope", handle_horoscope_command))
     application.add_handler(CommandHandler("weekly", handle_weekly_command))
+    application.add_handler(CommandHandler("stats", handle_stats_command))
     application.add_handler(CommandHandler("backup", handle_backup_command))
+    application.add_handler(CommandHandler("morning", handle_morning_command))
     application.add_handler(
         CallbackQueryHandler(handle_votekick_callback, pattern=r"^votekick:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(handle_morning_callback, pattern=r"^morning:react$")
     )
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     application.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker_message))
@@ -1835,6 +2640,21 @@ def main() -> None:
             "недельный дайджест не запланирован: CHAT_ID=%s WEEKLY_DIGEST_TIME=%s",
             allowed_chat_id,
             os.getenv("WEEKLY_DIGEST_TIME", ""),
+        )
+
+    morning_greeting_time = get_morning_greeting_time(tz)
+    if allowed_chat_id is not None and morning_greeting_time is not None:
+        application.job_queue.run_daily(
+            send_scheduled_morning_greeting,
+            time=morning_greeting_time,
+            name="morning_greeting",
+        )
+        logger.info("утреннее приветствие запланировано на %s (%s)", morning_greeting_time, tz)
+    else:
+        logger.warning(
+            "утреннее приветствие не запланировано: CHAT_ID=%s MORNING_GREETING_TIME=%s",
+            allowed_chat_id,
+            os.getenv("MORNING_GREETING_TIME", ""),
         )
 
     logger.info("bot started")
