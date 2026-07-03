@@ -38,8 +38,9 @@ NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 IMGFLIP_MEMES_ENDPOINT = "https://api.imgflip.com/get_memes"
 MEME_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.25
+MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.20
 MEME_MIN_FONT_WIDTH_RATIO = 0.05
+MEME_SAFE_TEXT_PATTERN = re.compile(r"[^а-яА-ЯёЁa-zA-Z0-9\s.,!?—\-:;()]")
 MEME_TEMPLATE_LIMIT = 20
 MEME_TEMPLATE_INDEX_PATH = TEMPLATES_DIR / "index.json"
 MEME_TEMPLATE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
@@ -58,6 +59,11 @@ BOT_COMMANDS = [
 RAT_CHARACTER_INTRO = (
     "Ты — RAT, саркастичный, остроумный и слегка нахальный летописец дружеского чата. "
     "Ты подмечаешь конкретные детали и цепляешься за них, а не отделываешься общими фразами."
+)
+NO_PROFANITY_INSTRUCTION = (
+    "Даже если в исходных сообщениях чата встречается мат или нецензурная лексика — никогда "
+    "не используй мат в своих ответах. Сарказм и колкость передавай без ругательств, "
+    "литературными или разговорными словами."
 )
 
 RUSSIAN_STOP_WORDS = frozenset(
@@ -328,11 +334,13 @@ ROAST_PROMPT_TEMPLATE = (
 
 NONSENSE_PROMPT_TEMPLATE = (
     "{character_intro}\n"
-    "Вот несколько случайных реальных реплик из истории этого чата: {messages}. "
-    "Возьми обрывки из них и слепи одну короткую абсурдную фразу-нонсенс — будто ты (RAT) "
-    "вдруг ляпнул что-то дикое не в тему. Это должно быть по-настоящему смешно и неожиданно, "
-    "не просто бессвязный набор слов — используй абсурдные, но узнаваемые сопоставления. "
-    "Одно предложение, максимум два. Не используй кавычки в ответе."
+    "Вот случайная реальная фраза из истории этого чата: '{message}'. "
+    "Напиши ОДИН короткий, по-настоящему смешной комментарий-реакцию на эту фразу — "
+    "используй конкретный приём: гиперболу, неожиданный вывод, ироничное преувеличение "
+    "или абсурдное 'что, если...' развитие мысли. Оттолкнись ИМЕННО от этой фразы, "
+    "не добавляй посторонние несвязанные детали и темы — весь юмор должен строиться "
+    "вокруг одной этой мысли, а не мешанины из разного. Одно предложение, максимум два. "
+    "Без кавычек в ответе."
 )
 
 MEME_CAPTION_PROMPT_TEMPLATE = (
@@ -341,9 +349,27 @@ MEME_CAPTION_PROMPT_TEMPLATE = (
     "Ты делаешь классический мем на шаблоне «{template_name}». "
     "Механика шаблона: {template_description}.\n"
     "Придумай подпись на русском, коротко и смешно, в тему выбранных реплик и в духе персонажа RAT. "
+    "Название мем-шаблона: '{template_name}'. Ты наверняка знаешь классическую структуру и механику "
+    "этого формата (например: сравнение/выбор между двумя вариантами, реакция-разоблачение, "
+    "нарастающий абсурд, и т.п.) — используй именно эту механику при распределении текста между "
+    "top_text и bottom_text, а не просто две произвольные фразы. Если не уверен в точной механике "
+    "конкретного шаблона — сделай раскладку в духе 'ожидание/сначала' сверху и "
+    "'неожиданный поворот/на самом деле' снизу.\n\n"
+    "ВАЖНО про сам панчлайн: он должен содержать настоящий неожиданный поворот, контраст или "
+    "разоблачение — а не просто описывать ситуацию или констатировать факт. Плохой пример механики "
+    "(не для копирования, просто для понимания разницы): констатация 'все будут переживать' — "
+    "это плоско. Хороший панчлайн вскрывает нелепость, доводит до абсурда, или переворачивает "
+    "ожидание. Представь, что рассказываешь это лучшему другу, чтобы он заржал в голос, "
+    "а не просто кивнул понимающе.\n"
+    "Избегай формата 'A = B, следствие C' как двух несвязанных ярлыков — вместо этого top_text "
+    "и bottom_text должны звучать как одна цельная мысль с сюжетным поворотом между ними, "
+    "а не как две отдельные подписи-этикетки. "
     "top_text и bottom_text должны быть короткими фразами, максимум 5-6 слов каждая — "
     "как в настоящих мемах, не пиши длинные предложения. "
     "Желательно, чтобы каждая фраза умещалась в одну строку. "
+    "Используй только обычные русские и латинские буквы, цифры и стандартную пунктуацию "
+    "(точка, запятая, восклицательный/вопросительный знак, тире-минус). НЕ используй эмодзи "
+    "и специальные юникод-символы (например ➡️, 🤝, ✅ и подобные) — только простой текст. "
     "Если нижняя строка не нужна, верни её пустой строкой.\n"
     "Верни ТОЛЬКО строгий валидный JSON без markdown, без пояснений, строго такого вида:\n"
     '{{"top_text": "верхняя строка", "bottom_text": "нижняя строка"}}'
@@ -983,7 +1009,7 @@ def fetch_all_chat_texts(chat_id: int) -> list[str]:
     return [row["text"] for row in rows if row["text"] and row["text"].strip()]
 
 
-def fetch_random_messages_sample(chat_id: int, n: int = 8) -> list[str]:
+def fetch_random_messages_sample(chat_id: int, n: int = 1) -> list[str]:
     if n <= 0:
         return []
 
@@ -996,13 +1022,18 @@ def fetch_random_messages_sample(chat_id: int, n: int = 8) -> list[str]:
             WHERE chat_id = ?
               AND (is_bot IS NULL OR is_bot = 0)
               AND trim(text) != ''
+              AND length(trim(text)) - length(replace(trim(text), ' ', '')) >= 3
             ORDER BY RANDOM()
             LIMIT ?
             """,
             (chat_id, n),
         ).fetchall()
 
-    return [row["text"].strip() for row in rows if row["text"] and row["text"].strip()]
+    return [
+        row["text"].strip()
+        for row in rows
+        if row["text"] and len(row["text"].strip().split()) >= 4
+    ]
 
 
 def extract_chat_slang(chat_id: int) -> list[str]:
@@ -1065,11 +1096,12 @@ def get_or_extract_chat_slang(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 
 def build_character_intro(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
     slang_words = get_or_extract_chat_slang(context, chat_id)
+    base_intro = f"{RAT_CHARACTER_INTRO}\n{NO_PROFANITY_INSTRUCTION}"
     if not slang_words:
-        return RAT_CHARACTER_INTRO
+        return base_intro
 
     slang_instruction = SLANG_INSTRUCTION_TEMPLATE.format(words=", ".join(slang_words))
-    return f"{RAT_CHARACTER_INTRO}\n{slang_instruction}"
+    return f"{base_intro}\n{slang_instruction}"
 
 
 def get_recent_generated_texts(
@@ -1284,7 +1316,8 @@ def generate_nonsense_phrase(chain: dict[tuple[str, str], list[str]]) -> str | N
 
 
 def normalize_meme_text(text: str) -> str:
-    return " ".join(str(text or "").split()).strip().upper()
+    safe_text = MEME_SAFE_TEXT_PATTERN.sub("", str(text or ""))
+    return " ".join(safe_text.split()).strip().upper()
 
 
 def split_word_to_fit(
@@ -1477,7 +1510,7 @@ def render_meme_template(image_path: Path, top_text: str, bottom_text: str) -> b
     if not top and not bottom:
         raise ValueError("meme caption is empty")
 
-    max_font_size = max(24, min(width // 7, height // 5))
+    max_font_size = max(24, min(width // 9, height // 6))
     min_font_size = min(max_font_size, max(14, int(width * MEME_MIN_FONT_WIDTH_RATIO)))
     max_block_height = max(1, int(height * MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO))
     if top and bottom:
@@ -1830,7 +1863,7 @@ async def generate_nonsense_phrase_gemini(
     recent_phrases = get_recent_generated_texts(context, "recent_nonsense_phrases", chat_id)
     prompt = NONSENSE_PROMPT_TEMPLATE.format(
         character_intro=character_intro,
-        messages=" | ".join(sample),
+        message=sample[0],
     )
     prompt += format_recent_nonsense_phrases_instruction(recent_phrases)
 
