@@ -2,14 +2,18 @@ import html
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
+import textwrap
 from contextlib import closing
 from datetime import datetime, time, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
+from PIL import Image, ImageDraw, ImageFont
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import (
     Application,
@@ -29,6 +33,7 @@ DB_PATH = Path(os.getenv("DB_PATH", DATA_DIR / "messages.sqlite3"))
 LOG_PATH = Path(os.getenv("LOG_PATH", LOG_DIR / "bot.log"))
 NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+MEME_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
 BOT_COMMANDS = [
     ("digest", "Собрать сводку дня (спойлер: будет больно)"),
@@ -204,6 +209,50 @@ def get_votekick_duration() -> timedelta:
     return timedelta(minutes=minutes)
 
 
+def get_nonsense_chain_refresh_interval() -> timedelta:
+    raw = os.getenv("NONSENSE_CHAIN_REFRESH_MINUTES", "60").strip()
+    try:
+        minutes = float(raw)
+    except ValueError:
+        minutes = 60.0
+
+    return timedelta(minutes=minutes)
+
+
+def get_nonsense_cooldown() -> timedelta:
+    raw = os.getenv("NONSENSE_COOLDOWN_MINUTES", "30").strip()
+    try:
+        minutes = float(raw)
+    except ValueError:
+        minutes = 30.0
+
+    return timedelta(minutes=minutes)
+
+
+def get_nonsense_reaction_chance() -> float:
+    raw = os.getenv("NONSENSE_REACTION_CHANCE", "0.03").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.03
+
+
+def get_nonsense_min_messages() -> int:
+    raw = os.getenv("NONSENSE_MIN_MESSAGES", "300").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return 300
+
+
+def get_meme_render_chance() -> float:
+    raw = os.getenv("MEME_RENDER_CHANCE", "0.4").strip()
+    try:
+        return float(raw)
+    except ValueError:
+        return 0.4
+
+
 def get_app_timezone() -> ZoneInfo:
     timezone_name = os.getenv("TZ", "Europe/Moscow").strip() or "Europe/Moscow"
     try:
@@ -256,6 +305,29 @@ def init_db() -> None:
             )
             """
         )
+
+        existing_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(messages)").fetchall()
+        }
+        if "is_bot" not in existing_columns:
+            connection.execute("ALTER TABLE messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
+
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                user_id INTEGER,
+                media_type TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                file_unique_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
         connection.commit()
 
 
@@ -356,6 +428,33 @@ def fetch_user_messages(
         return connection.execute(query, params).fetchall()
 
 
+def count_chat_messages(chat_id: int) -> int:
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        row = connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+
+    return row[0] if row else 0
+
+
+def fetch_all_chat_texts(chat_id: int) -> list[str]:
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT text
+            FROM messages
+            WHERE chat_id = ?
+              AND (is_bot IS NULL OR is_bot = 0)
+            ORDER BY message_datetime ASC, message_id ASC
+            """,
+            (chat_id,),
+        ).fetchall()
+
+    return [row["text"] for row in rows if row["text"] and row["text"].strip()]
+
+
 def get_author_name(row: sqlite3.Row, name_map: dict[str, str]) -> str:
     username = row["username"]
     if username:
@@ -388,6 +487,78 @@ def build_horoscope_request(
     transcript = build_messages_transcript(messages, name_map)
     topics = transcript if transcript else "ничего особенного"
     return HOROSCOPE_PROMPT_TEMPLATE.format(topics=topics, names=", ".join(names))
+
+
+def build_markov_chain(texts: list[str]) -> dict[tuple[str, str], list[str]]:
+    chain: dict[tuple[str, str], list[str]] = {}
+    for text in texts:
+        words = text.split()
+        if len(words) < 3:
+            continue
+        for i in range(len(words) - 2):
+            key = (words[i], words[i + 1])
+            chain.setdefault(key, []).append(words[i + 2])
+
+    return chain
+
+
+def generate_nonsense_phrase(chain: dict[tuple[str, str], list[str]]) -> str | None:
+    if not chain:
+        return None
+
+    words = list(random.choice(list(chain.keys())))
+    target_length = random.randint(5, 20)
+
+    while len(words) < target_length:
+        next_words = chain.get((words[-2], words[-1]))
+        if not next_words:
+            break
+        words.append(random.choice(next_words))
+
+    return " ".join(words)
+
+
+def render_meme(image_bytes: bytes, text: str) -> bytes:
+    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+    draw = ImageDraw.Draw(image)
+    width, height = image.size
+
+    font_size = max(24, width // 12)
+    font = ImageFont.truetype(MEME_FONT_PATH, font_size)
+    stroke_width = max(2, font_size // 15)
+    line_height = int(font_size * 1.2)
+
+    chars_per_line = max(10, (width // (font_size // 2 or 1)))
+    wrapped_lines = textwrap.wrap(text.upper(), width=chars_per_line) or [text.upper()]
+
+    if len(wrapped_lines) * line_height > height * 0.6 and len(wrapped_lines) > 1:
+        split = (len(wrapped_lines) + 1) // 2
+        top_lines, bottom_lines = wrapped_lines[:split], wrapped_lines[split:]
+    else:
+        top_lines, bottom_lines = wrapped_lines, []
+
+    def draw_block(lines: list[str], start_y: float) -> None:
+        y = start_y
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+            x = (width - (bbox[2] - bbox[0])) / 2
+            draw.text(
+                (x, y),
+                line,
+                font=font,
+                fill="white",
+                stroke_width=stroke_width,
+                stroke_fill="black",
+            )
+            y += line_height
+
+    draw_block(top_lines, 10)
+    if bottom_lines:
+        draw_block(bottom_lines, height - line_height * len(bottom_lines) - 10)
+
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 async def generate_gemini_text(prompt: str) -> str:
@@ -506,14 +677,14 @@ def build_votekick_text(target_name: str, votes: dict[int, str]) -> str:
 async def maybe_reply_to_rat_mention(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
-) -> None:
+) -> bool:
     text = message.text
     if not text or not RAT_MENTION_PATTERN.search(text):
-        return
+        return False
 
     author = message.from_user
     if author is not None and author.is_bot:
-        return
+        return False
 
     last_triggered_at: dict[int, datetime] = context.application.bot_data.setdefault(
         "rat_reply_last_at", {}
@@ -523,18 +694,94 @@ async def maybe_reply_to_rat_mention(
     cooldown = get_rat_reply_cooldown()
     previous = last_triggered_at.get(chat_id)
     if previous is not None and now - previous < cooldown:
-        return
+        return False
 
     prompt = RAT_REPLY_PROMPT_TEMPLATE.format(text=text)
     try:
         reply = await generate_gemini_text(prompt)
     except Exception:
         logger.exception("rat mention reply: Gemini error")
-        return
+        return False
 
     last_triggered_at[chat_id] = now
     await message.reply_text(reply)
     logger.info("rat mention triggered text=%r reply=%r", text[:120], reply[:120])
+    return True
+
+
+async def get_or_build_markov_chain(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> dict[tuple[str, str], list[str]]:
+    cache: dict[int, dict] = context.application.bot_data.setdefault("markov_chain_cache", {})
+    now = datetime.now(timezone.utc)
+    refresh_interval = get_nonsense_chain_refresh_interval()
+
+    cached = cache.get(chat_id)
+    if cached is not None and now - cached["built_at"] < refresh_interval:
+        return cached["chain"]
+
+    texts = fetch_all_chat_texts(chat_id)
+    chain = build_markov_chain(texts)
+    cache[chat_id] = {"chain": chain, "built_at": now}
+    logger.info(
+        "markov chain rebuilt chat_id=%s texts=%s chain_keys=%s",
+        chat_id,
+        len(texts),
+        len(chain),
+    )
+    return chain
+
+
+async def maybe_send_nonsense_reaction(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> None:
+    if random.random() > get_nonsense_reaction_chance():
+        return
+
+    last_triggered_at: dict[int, datetime] = context.application.bot_data.setdefault(
+        "nonsense_last_at", {}
+    )
+    now = datetime.now(timezone.utc)
+    cooldown = get_nonsense_cooldown()
+    previous = last_triggered_at.get(chat_id)
+    if previous is not None and now - previous < cooldown:
+        return
+
+    if count_chat_messages(chat_id) < get_nonsense_min_messages():
+        return
+
+    chain = await get_or_build_markov_chain(context, chat_id)
+    phrase = generate_nonsense_phrase(chain)
+    if phrase is None:
+        return
+
+    sent_as_meme = False
+    photo_row = fetch_random_photo_media(chat_id)
+    if photo_row is not None and random.random() <= get_meme_render_chance():
+        try:
+            telegram_file = await context.bot.get_file(photo_row["file_id"])
+            image_bytes = bytes(await telegram_file.download_as_bytearray())
+            meme_bytes = render_meme(image_bytes, phrase)
+            await message.reply_photo(photo=BytesIO(meme_bytes))
+            sent_as_meme = True
+        except Exception:
+            logger.exception(
+                "nonsense reaction: meme render failed chat_id=%s, falling back to text", chat_id
+            )
+
+    if not sent_as_meme:
+        await message.reply_text(phrase)
+
+    last_triggered_at[chat_id] = now
+    logger.info(
+        "nonsense reaction triggered chat_id=%s kind=%s phrase=%r",
+        chat_id,
+        "meme" if sent_as_meme else "text",
+        phrase[:200],
+    )
 
 
 def save_message(
@@ -546,6 +793,7 @@ def save_message(
     display_name: str | None,
     text: str,
     message_datetime: str,
+    is_bot: bool,
 ) -> None:
     with closing(sqlite3.connect(DB_PATH)) as connection:
         connection.execute(
@@ -557,9 +805,10 @@ def save_message(
                 username,
                 display_name,
                 text,
-                message_datetime
+                message_datetime,
+                is_bot
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message_id,
@@ -569,9 +818,62 @@ def save_message(
                 display_name,
                 text,
                 message_datetime,
+                int(is_bot),
             ),
         )
         connection.commit()
+
+
+def save_media(
+    *,
+    chat_id: int,
+    message_id: int,
+    user_id: int | None,
+    media_type: str,
+    file_id: str,
+    file_unique_id: str,
+    media_date: str,
+) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.execute(
+            """
+            INSERT INTO media (
+                chat_id,
+                message_id,
+                user_id,
+                media_type,
+                file_id,
+                file_unique_id,
+                date
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                chat_id,
+                message_id,
+                user_id,
+                media_type,
+                file_id,
+                file_unique_id,
+                media_date,
+            ),
+        )
+        connection.commit()
+
+
+def fetch_random_photo_media(chat_id: int) -> sqlite3.Row | None:
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.row_factory = sqlite3.Row
+        return connection.execute(
+            """
+            SELECT file_id
+            FROM media
+            WHERE chat_id = ? AND media_type = 'photo'
+            ORDER BY RANDOM()
+            LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
 
 
 async def handle_text_message(
@@ -600,6 +902,7 @@ async def handle_text_message(
         display_name=display_name,
         text=message.text,
         message_datetime=message_datetime,
+        is_bot=bool(user.is_bot) if user else False,
     )
 
     logger.info(
@@ -610,7 +913,81 @@ async def handle_text_message(
         message.text[:120],
     )
 
-    await maybe_reply_to_rat_mention(message, context)
+    rat_triggered = await maybe_reply_to_rat_mention(message, context)
+    if not rat_triggered:
+        await maybe_send_nonsense_reaction(message, context, chat.id)
+
+
+async def handle_photo_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    allowed_chat_id = get_allowed_chat_id()
+
+    if message is None or chat is None or not message.photo:
+        return
+
+    if allowed_chat_id is not None and chat.id != allowed_chat_id:
+        return
+
+    largest_photo = message.photo[-1]
+    media_date = message.date.astimezone(timezone.utc).isoformat()
+
+    save_media(
+        chat_id=chat.id,
+        message_id=message.message_id,
+        user_id=user.id if user else None,
+        media_type="photo",
+        file_id=largest_photo.file_id,
+        file_unique_id=largest_photo.file_unique_id,
+        media_date=media_date,
+    )
+
+    logger.info(
+        "saved media chat_id=%s message_id=%s type=photo file_unique_id=%s",
+        chat.id,
+        message.message_id,
+        largest_photo.file_unique_id,
+    )
+
+
+async def handle_sticker_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    allowed_chat_id = get_allowed_chat_id()
+
+    if message is None or chat is None or message.sticker is None:
+        return
+
+    if allowed_chat_id is not None and chat.id != allowed_chat_id:
+        return
+
+    sticker = message.sticker
+    media_date = message.date.astimezone(timezone.utc).isoformat()
+
+    save_media(
+        chat_id=chat.id,
+        message_id=message.message_id,
+        user_id=user.id if user else None,
+        media_type="sticker",
+        file_id=sticker.file_id,
+        file_unique_id=sticker.file_unique_id,
+        media_date=media_date,
+    )
+
+    logger.info(
+        "saved media chat_id=%s message_id=%s type=sticker file_unique_id=%s",
+        chat.id,
+        message.message_id,
+        sticker.file_unique_id,
+    )
 
 
 async def handle_digest_command(
@@ -1093,6 +1470,8 @@ def main() -> None:
     application.add_handler(
         CallbackQueryHandler(handle_votekick_callback, pattern=r"^votekick:")
     )
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
+    application.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker_message))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
