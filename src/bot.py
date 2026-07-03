@@ -1,13 +1,16 @@
+import html
+import json
 import logging
 import os
+import re
 import sqlite3
 from contextlib import closing
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from telegram import Update
+from telegram import BotCommand, Message, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 
@@ -20,17 +23,36 @@ LOG_PATH = Path(os.getenv("LOG_PATH", LOG_DIR / "bot.log"))
 NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
+BOT_COMMANDS = [
+    ("digest", "Собрать сводку дня (спойлер: будет больно)"),
+]
+
 DIGEST_PROMPT = """Ты — саркастичный, острый на язык летописец дружеского чата.
-На основе сообщений за день напиши короткую сводку в саркастичном тоне.
+На основе сообщений за день собери саркастичную сводку.
 Сарказм — да, но по-доброму, без оскорблений, без перехода на личности, без токсичности по внешности, здоровью, национальности и подобным болезненным темам.
 
-Структура ответа:
-1) Саркастичный пересказ дня — 2-4 предложения о том, что обсуждали.
-2) "Цитата дня:" — одна самая абсурдная или смешная РЕАЛЬНАЯ фраза из чата дословно, с указанием автора.
-3) "Номинации дня:" — 2-3 шуточные номинации участникам, например "Душнила дня" или "Главный оффтоп", с короткими обоснованиями.
+Верни ТОЛЬКО валидный JSON, без markdown-обёртки (без ```), без каких-либо пояснений или текста до и после JSON, строго такой структуры:
+{
+  "intro": "саркастичный пересказ дня, 2-4 предложения о том, что обсуждали",
+  "quote_text": "самая абсурдная или смешная РЕАЛЬНАЯ фраза из чата дословно",
+  "quote_author": "имя автора цитаты",
+  "nominations": [
+    {"title": "Название номинации, например Душнила дня", "name": "Имя", "reason": "короткое обоснование"}
+  ]
+}
 
-Обращайся к людям по именам. Пиши на русском. Не выдумывай сообщений, которых не было.
+В "nominations" верни 2-3 объекта. Обращайся к людям по именам. Пиши на русском. Не выдумывай сообщений, которых не было.
 """
+
+RAT_MENTION_PATTERN = re.compile(r"\bкрыс[а-яё]*\b", re.IGNORECASE)
+
+RAT_REPLY_PROMPT_TEMPLATE = (
+    "Ты — саркастичный, но добрый бот по имени RAT в дружеском Telegram-чате. "
+    "Кто-то в чате только что упомянул слово 'крыса' (в каком-то виде) в сообщении: '{text}'. "
+    "Придумай короткий остроумный ответ на 1-2 предложения, обыгрывающий это упоминание "
+    "в шуточной саркастичной манере. Без оскорблений, без перехода на личности. "
+    "Ответь только текстом реплики, без кавычек и пояснений."
+)
 
 
 logger = logging.getLogger(__name__)
@@ -58,6 +80,32 @@ def get_allowed_chat_id() -> int | None:
         return int(chat_id)
     except ValueError as exc:
         raise RuntimeError("CHAT_ID must be an integer or empty") from exc
+
+
+def get_digest_time(tz: ZoneInfo) -> time | None:
+    raw = os.getenv("DIGEST_TIME", "").strip()
+    if not raw:
+        return None
+
+    try:
+        hour_str, minute_str = raw.split(":", 1)
+        hour, minute = int(hour_str), int(minute_str)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError as exc:
+        raise RuntimeError(f"DIGEST_TIME must be in HH:MM format, got {raw!r}") from exc
+
+    return time(hour=hour, minute=minute, tzinfo=tz)
+
+
+def get_rat_reply_cooldown() -> timedelta:
+    raw = os.getenv("RAT_REPLY_COOLDOWN_MINUTES", "7").strip()
+    try:
+        minutes = float(raw)
+    except ValueError:
+        minutes = 7.0
+
+    return timedelta(minutes=minutes)
 
 
 def get_app_timezone() -> ZoneInfo:
@@ -163,10 +211,10 @@ def build_digest_request(messages: list[sqlite3.Row], name_map: dict[str, str]) 
     return f"{DIGEST_PROMPT}\n\nСообщения за день:\n" + "\n".join(lines)
 
 
-async def generate_digest_with_gemini(prompt: str) -> str:
+async def generate_gemini_text(prompt: str) -> str:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is required for /digest")
+        raise RuntimeError("GEMINI_API_KEY is required")
 
     model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip() or "gemini-3.5-flash"
     url = GEMINI_ENDPOINT.format(model=model)
@@ -204,6 +252,81 @@ async def generate_digest_with_gemini(prompt: str) -> str:
         raise RuntimeError(f"Gemini API returned empty text: {data}")
 
     return text
+
+
+def parse_digest_json(raw_text: str) -> dict:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\s*\n", "", cleaned)
+        cleaned = re.sub(r"\n?```\s*$", "", cleaned)
+        cleaned = cleaned.strip()
+
+    return json.loads(cleaned)
+
+
+def escape_html(text: str) -> str:
+    return html.escape(text, quote=False)
+
+
+def format_digest_html(data: dict) -> str:
+    intro = escape_html(str(data.get("intro", "")).strip())
+    quote_text = escape_html(str(data.get("quote_text", "")).strip())
+    quote_author = escape_html(str(data.get("quote_author", "")).strip())
+    nominations = data.get("nominations") or []
+
+    lines = [
+        "🐀 <b>Сводка дня</b>",
+        "",
+        intro,
+        "",
+        "<b>Цитата дня:</b>",
+        f"<blockquote>{quote_text}</blockquote>",
+        f"<i>— {quote_author}</i>",
+        "",
+        "<b>Номинации дня:</b>",
+    ]
+
+    for nomination in nominations:
+        title = escape_html(str(nomination.get("title", "")).strip())
+        name = escape_html(str(nomination.get("name", "")).strip())
+        reason = escape_html(str(nomination.get("reason", "")).strip())
+        lines.append(f"<b>{title}</b> — {name} — {reason}")
+
+    return "\n".join(lines)
+
+
+async def maybe_reply_to_rat_mention(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    text = message.text
+    if not text or not RAT_MENTION_PATTERN.search(text):
+        return
+
+    author = message.from_user
+    if author is not None and author.is_bot:
+        return
+
+    last_triggered_at: dict[int, datetime] = context.application.bot_data.setdefault(
+        "rat_reply_last_at", {}
+    )
+    chat_id = message.chat_id
+    now = datetime.now(timezone.utc)
+    cooldown = get_rat_reply_cooldown()
+    previous = last_triggered_at.get(chat_id)
+    if previous is not None and now - previous < cooldown:
+        return
+
+    prompt = RAT_REPLY_PROMPT_TEMPLATE.format(text=text)
+    try:
+        reply = await generate_gemini_text(prompt)
+    except Exception:
+        logger.exception("rat mention reply: Gemini error")
+        return
+
+    last_triggered_at[chat_id] = now
+    await message.reply_text(reply)
+    logger.info("rat mention triggered text=%r reply=%r", text[:120], reply[:120])
 
 
 def save_message(
@@ -247,8 +370,6 @@ async def handle_text_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
-    del context
-
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
@@ -280,6 +401,8 @@ async def handle_text_message(
         user.id if user else None,
         message.text[:120],
     )
+
+    await maybe_reply_to_rat_mention(message, context)
 
 
 async def handle_digest_command(
@@ -313,14 +436,57 @@ async def handle_digest_command(
     prompt = build_digest_request(rows, name_map)
 
     try:
-        digest = await generate_digest_with_gemini(prompt)
+        raw_digest = await generate_gemini_text(prompt)
+        digest_data = parse_digest_json(raw_digest)
     except Exception:
         logger.exception("failed to generate digest with Gemini")
         await message.reply_text("Не смог собрать сводку, попробуйте позже")
         return
 
     logger.info("/digest generated successfully chat_id=%s", allowed_chat_id)
-    await message.reply_text(digest)
+    await message.reply_text(format_digest_html(digest_data), parse_mode="HTML")
+
+
+async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None:
+        logger.warning("автосводка пропущена: CHAT_ID не настроен")
+        return
+
+    tz = get_app_timezone()
+    name_map = context.application.bot_data.get("name_map", {})
+    rows = fetch_today_messages(allowed_chat_id, tz)
+
+    if not rows:
+        logger.info("автосводка пропущена: нет сообщений за день")
+        return
+
+    prompt = build_digest_request(rows, name_map)
+
+    try:
+        raw_digest = await generate_gemini_text(prompt)
+        digest_data = parse_digest_json(raw_digest)
+    except Exception:
+        logger.exception("автосводка: ошибка при обращении к Gemini")
+        return
+
+    await context.bot.send_message(
+        chat_id=allowed_chat_id,
+        text=format_digest_html(digest_data),
+        parse_mode="HTML",
+    )
+    logger.info(
+        "автосводка отправлена chat_id=%s messages_count=%s",
+        allowed_chat_id,
+        len(rows),
+    )
+
+
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands(
+        [BotCommand(name, description) for name, description in BOT_COMMANDS]
+    )
+    logger.info("bot commands registered: %s", [name for name, _ in BOT_COMMANDS])
 
 
 def main() -> None:
@@ -337,12 +503,24 @@ def main() -> None:
     else:
         logger.info("bot will save text messages from chat_id=%s", allowed_chat_id)
 
-    application = Application.builder().token(token).build()
+    application = Application.builder().token(token).post_init(post_init).build()
     application.bot_data["name_map"] = load_name_map()
     application.add_handler(CommandHandler("digest", handle_digest_command))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
+
+    tz = get_app_timezone()
+    digest_time = get_digest_time(tz)
+    if allowed_chat_id is not None and digest_time is not None:
+        application.job_queue.run_daily(send_daily_digest, time=digest_time, name="daily_digest")
+        logger.info("автосводка запланирована на %s (%s)", digest_time, tz)
+    else:
+        logger.warning(
+            "автосводка не запланирована: CHAT_ID=%s DIGEST_TIME=%s",
+            allowed_chat_id,
+            os.getenv("DIGEST_TIME", ""),
+        )
 
     logger.info("bot started")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
