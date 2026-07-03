@@ -1,0 +1,9 @@
+# username = имя
+Vanchest = Ваня
+theunrealgiordanobruno = Данис
+VladimirX23 = Вова
+pmalakhanov = Паша
+maximgarin = Макс
+Amoskari = Юля
+Gaarrs = Арсений
+starlord1 = Костя

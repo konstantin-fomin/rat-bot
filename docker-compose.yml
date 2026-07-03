@@ -10,5 +10,6 @@ services:
     volumes:
       - ./data:/app/data
       - ./logs:/app/logs
+      - ./config:/app/config:ro
       - ./.env:/app/.env:ro
     restart: always
