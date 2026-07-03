@@ -5,6 +5,7 @@ data/*.db
 data/*.sqlite
 data/*.sqlite3
 logs/
+templates/
 
 # Python
 __pycache__/

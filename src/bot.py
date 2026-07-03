@@ -6,12 +6,12 @@ import random
 import re
 import sqlite3
 import tempfile
-import textwrap
 from collections import Counter, defaultdict
 from contextlib import closing
 from datetime import datetime, time, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -31,11 +31,18 @@ BASE_DIR = Path("/app")
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
 LOG_DIR = Path(os.getenv("LOG_DIR", BASE_DIR / "logs"))
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", BASE_DIR / "config"))
+TEMPLATES_DIR = Path(os.getenv("TEMPLATES_DIR", BASE_DIR / "templates"))
 DB_PATH = Path(os.getenv("DB_PATH", DATA_DIR / "messages.sqlite3"))
 LOG_PATH = Path(os.getenv("LOG_PATH", LOG_DIR / "bot.log"))
 NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+IMGFLIP_MEMES_ENDPOINT = "https://api.imgflip.com/get_memes"
 MEME_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.25
+MEME_MIN_FONT_WIDTH_RATIO = 0.05
+MEME_TEMPLATE_LIMIT = 20
+MEME_TEMPLATE_INDEX_PATH = TEMPLATES_DIR / "index.json"
+MEME_TEMPLATE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 BOT_COMMANDS = [
     ("digest", "Собрать сводку дня (спойлер: будет больно)"),
@@ -319,6 +326,29 @@ ROAST_PROMPT_TEMPLATE = (
     + NO_CLICHES_INSTRUCTION
 )
 
+NONSENSE_PROMPT_TEMPLATE = (
+    "{character_intro}\n"
+    "Вот несколько случайных реальных реплик из истории этого чата: {messages}. "
+    "Возьми обрывки из них и слепи одну короткую абсурдную фразу-нонсенс — будто ты (RAT) "
+    "вдруг ляпнул что-то дикое не в тему. Это должно быть по-настоящему смешно и неожиданно, "
+    "не просто бессвязный набор слов — используй абсурдные, но узнаваемые сопоставления. "
+    "Одно предложение, максимум два. Не используй кавычки в ответе."
+)
+
+MEME_CAPTION_PROMPT_TEMPLATE = (
+    "{character_intro}\n"
+    "Вот несколько случайных реальных реплик из истории этого чата: {messages}.\n"
+    "Ты делаешь классический мем на шаблоне «{template_name}». "
+    "Механика шаблона: {template_description}.\n"
+    "Придумай подпись на русском, коротко и смешно, в тему выбранных реплик и в духе персонажа RAT. "
+    "top_text и bottom_text должны быть короткими фразами, максимум 5-6 слов каждая — "
+    "как в настоящих мемах, не пиши длинные предложения. "
+    "Желательно, чтобы каждая фраза умещалась в одну строку. "
+    "Если нижняя строка не нужна, верни её пустой строкой.\n"
+    "Верни ТОЛЬКО строгий валидный JSON без markdown, без пояснений, строго такого вида:\n"
+    '{{"top_text": "верхняя строка", "bottom_text": "нижняя строка"}}'
+)
+
 HOROSCOPE_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Сегодня в чате обсуждали (кратко): {topics}.\n"
@@ -370,6 +400,156 @@ VOTEKICK_SPARED_PROMPT_TEMPLATE = (
 logger = logging.getLogger(__name__)
 
 
+def meme_template_description(template_name: str) -> str:
+    normalized = template_name.lower()
+    descriptions = {
+        "drake hotline bling": "отвергает первый вариант и одобряет второй",
+        "distracted boyfriend": "персонаж отвлекается от привычного выбора на более соблазнительный вариант",
+        "two buttons": "мучительный выбор между двумя неудобными вариантами",
+        "left exit": "резкий и нелепый уход с нормального пути к неожиданному решению",
+        "change my mind": "самоуверенное спорное утверждение, которое предлагается оспорить",
+        "expanding brain": "нарастающие уровни всё более странного или якобы гениального мышления",
+        "buff doge": "контраст сильной старой версии и слабой новой версии",
+        "woman yelling at cat": "эмоциональное обвинение против невозмутимой реакции",
+        "uno draw 25 cards": "человек выбирает наказание вместо простого действия",
+        "running away balloon": "кто-то теряет контроль над желаемой вещью или идеей",
+        "bernie i am once again asking": "настойчивая повторная просьба о чём-то",
+        "gru's plan": "план звучит нормально, пока внезапно не становится абсурдным",
+        "always has been": "внезапное признание, что странная правда была очевидна всегда",
+        "disaster girl": "невинное довольство на фоне хаоса",
+        "mocking spongebob": "насмешливое передразнивание чужой фразы",
+        "one does not simply": "нельзя просто так взять и сделать очевидную вещь",
+    }
+
+    for key, description in descriptions.items():
+        if key in normalized:
+            return description
+
+    return (
+        "обыграй верхнюю и нижнюю строку в контрасте; если шаблон подсказывает роли, "
+        "используй их естественно"
+    )
+
+
+def list_meme_template_files() -> list[Path]:
+    if not TEMPLATES_DIR.exists():
+        return []
+
+    return sorted(
+        path
+        for path in TEMPLATES_DIR.iterdir()
+        if path.is_file() and path.suffix.lower() in MEME_TEMPLATE_IMAGE_SUFFIXES
+    )
+
+
+def load_meme_template_index() -> dict[str, str]:
+    if not MEME_TEMPLATE_INDEX_PATH.exists():
+        return {}
+
+    try:
+        raw = json.loads(MEME_TEMPLATE_INDEX_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.exception("failed to read meme template index: %s", MEME_TEMPLATE_INDEX_PATH)
+        return {}
+
+    if not isinstance(raw, dict):
+        logger.warning("meme template index has unexpected shape: %s", MEME_TEMPLATE_INDEX_PATH)
+        return {}
+
+    return {str(template_id): str(name) for template_id, name in raw.items()}
+
+
+def get_random_meme_template() -> tuple[Path, str] | None:
+    template_files = list_meme_template_files()
+    if not template_files:
+        return None
+
+    template_path = random.choice(template_files)
+    index = load_meme_template_index()
+    template_name = index.get(template_path.stem, template_path.stem)
+    return template_path, template_name
+
+
+def get_template_file_suffix(url: str) -> str:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix in MEME_TEMPLATE_IMAGE_SUFFIXES:
+        return suffix
+    return ".jpg"
+
+
+def ensure_meme_templates() -> None:
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+
+    existing_templates = list_meme_template_files()
+    if existing_templates:
+        logger.info(
+            "meme templates found locally: dir=%s count=%s; skipping download",
+            TEMPLATES_DIR,
+            len(existing_templates),
+        )
+        return
+
+    logger.info("meme templates not found; checking access to %s", IMGFLIP_MEMES_ENDPOINT)
+    try:
+        with httpx.Client(timeout=30, follow_redirects=True) as client:
+            response = client.get(IMGFLIP_MEMES_ENDPOINT)
+            response.raise_for_status()
+            data = response.json()
+            memes = data.get("data", {}).get("memes", [])
+            if not data.get("success") or not isinstance(memes, list):
+                logger.warning("Imgflip returned unexpected meme list response: %s", data)
+                return
+
+            downloaded: dict[str, str] = {}
+            for meme in memes[:MEME_TEMPLATE_LIMIT]:
+                template_id = str(meme.get("id", "")).strip()
+                template_name = str(meme.get("name", "")).strip()
+                template_url = str(meme.get("url", "")).strip()
+                if not template_id or not template_name or not template_url:
+                    continue
+
+                suffix = get_template_file_suffix(template_url)
+                template_path = TEMPLATES_DIR / f"{template_id}{suffix}"
+                try:
+                    image_response = client.get(template_url)
+                    image_response.raise_for_status()
+                    template_path.write_bytes(image_response.content)
+                except Exception:
+                    logger.exception(
+                        "failed to download meme template id=%s name=%r url=%s",
+                        template_id,
+                        template_name,
+                        template_url,
+                    )
+                    continue
+
+                downloaded[template_id] = template_name
+
+    except httpx.RequestError as exc:
+        logger.warning(
+            "Imgflip template download skipped: no network access to api.imgflip.com (%s)",
+            exc,
+        )
+        return
+    except Exception:
+        logger.exception("Imgflip template download failed")
+        return
+
+    if not downloaded:
+        logger.warning("Imgflip template download finished with zero downloaded templates")
+        return
+
+    MEME_TEMPLATE_INDEX_PATH.write_text(
+        json.dumps(downloaded, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    logger.info(
+        "downloaded meme templates from Imgflip: dir=%s count=%s",
+        TEMPLATES_DIR,
+        len(downloaded),
+    )
+
+
 def setup_logging() -> None:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -381,6 +561,7 @@ def setup_logging() -> None:
             logging.FileHandler(LOG_PATH, encoding="utf-8"),
         ],
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def get_allowed_chat_id() -> int | None:
@@ -769,6 +950,22 @@ def count_chat_messages(chat_id: int) -> int:
     return row[0] if row else 0
 
 
+def count_non_bot_chat_messages(chat_id: int) -> int:
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        row = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM messages
+            WHERE chat_id = ?
+              AND (is_bot IS NULL OR is_bot = 0)
+              AND trim(text) != ''
+            """,
+            (chat_id,),
+        ).fetchone()
+
+    return row[0] if row else 0
+
+
 def fetch_all_chat_texts(chat_id: int) -> list[str]:
     with closing(sqlite3.connect(DB_PATH)) as connection:
         connection.row_factory = sqlite3.Row
@@ -784,6 +981,28 @@ def fetch_all_chat_texts(chat_id: int) -> list[str]:
         ).fetchall()
 
     return [row["text"] for row in rows if row["text"] and row["text"].strip()]
+
+
+def fetch_random_messages_sample(chat_id: int, n: int = 8) -> list[str]:
+    if n <= 0:
+        return []
+
+    with closing(sqlite3.connect(DB_PATH)) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT text
+            FROM messages
+            WHERE chat_id = ?
+              AND (is_bot IS NULL OR is_bot = 0)
+              AND trim(text) != ''
+            ORDER BY RANDOM()
+            LIMIT ?
+            """,
+            (chat_id, n),
+        ).fetchall()
+
+    return [row["text"].strip() for row in rows if row["text"] and row["text"].strip()]
 
 
 def extract_chat_slang(chat_id: int) -> list[str]:
@@ -901,6 +1120,17 @@ def format_recent_roasts_instruction(recent_roasts: list[str]) -> str:
         "\n\nВот твои последние roast-подколы в этом чате: "
         f"{' | '.join(recent_roasts)}. "
         "НЕ повторяй эти формулировки, образы и структуру фраз — придумай новый ракурс подкола."
+    )
+
+
+def format_recent_nonsense_phrases_instruction(recent_phrases: list[str]) -> str:
+    if not recent_phrases:
+        return ""
+
+    return (
+        "\n\nВот твои последние такие фразы: "
+        f"{' | '.join(recent_phrases)}. "
+        "Не повторяй эти образы и структуру."
     )
 
 
@@ -1053,43 +1283,253 @@ def generate_nonsense_phrase(chain: dict[tuple[str, str], list[str]]) -> str | N
     return " ".join(words)
 
 
-def render_meme(image_bytes: bytes, text: str) -> bytes:
-    image = Image.open(BytesIO(image_bytes)).convert("RGB")
+def normalize_meme_text(text: str) -> str:
+    return " ".join(str(text or "").split()).strip().upper()
+
+
+def split_word_to_fit(
+    draw: ImageDraw.ImageDraw,
+    word: str,
+    font: ImageFont.FreeTypeFont,
+    stroke_width: int,
+    max_width: int,
+) -> list[str]:
+    parts: list[str] = []
+    current = ""
+    for char in word:
+        candidate = current + char
+        bbox = draw.textbbox((0, 0), candidate, font=font, stroke_width=stroke_width)
+        if current and bbox[2] - bbox[0] > max_width:
+            parts.append(current)
+            current = char
+        else:
+            current = candidate
+
+    if current:
+        parts.append(current)
+
+    return parts or [word]
+
+
+def wrap_meme_lines(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    stroke_width: int,
+    max_width: int,
+) -> list[str]:
+    words = text.split()
+    if not words:
+        return []
+
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        bbox = draw.textbbox((0, 0), candidate, font=font, stroke_width=stroke_width)
+        if not current or bbox[2] - bbox[0] <= max_width:
+            current = candidate
+            continue
+
+        lines.append(current)
+        word_bbox = draw.textbbox((0, 0), word, font=font, stroke_width=stroke_width)
+        if word_bbox[2] - word_bbox[0] <= max_width:
+            current = word
+        else:
+            split_parts = split_word_to_fit(draw, word, font, stroke_width, max_width)
+            lines.extend(split_parts[:-1])
+            current = split_parts[-1]
+
+    if current:
+        lines.append(current)
+
+    return lines
+
+
+def measure_meme_block(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    font: ImageFont.FreeTypeFont,
+    stroke_width: int,
+    line_gap: int,
+) -> tuple[int, int]:
+    if not lines:
+        return 0, 0
+
+    widths = []
+    heights = []
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+        widths.append(bbox[2] - bbox[0])
+        heights.append(bbox[3] - bbox[1])
+
+    return max(widths), sum(heights) + line_gap * (len(lines) - 1)
+
+
+def get_meme_font_settings(font_size: int) -> tuple[ImageFont.FreeTypeFont, int, int]:
+    font = ImageFont.truetype(MEME_FONT_PATH, font_size)
+    stroke_width = max(2, font_size // 14)
+    line_gap = max(3, font_size // 8)
+    return font, stroke_width, line_gap
+
+
+def truncate_meme_text_to_fit(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    font: ImageFont.FreeTypeFont,
+    stroke_width: int,
+    line_gap: int,
+    max_width: int,
+    max_height: int,
+) -> tuple[list[str], int]:
+    words = text.split()
+    if not words:
+        return [], 0
+
+    for word_count in range(len(words), 0, -1):
+        trimmed = " ".join(words[:word_count]).rstrip(" ,.!?;:…")
+        candidate = f"{trimmed}…" if trimmed else "…"
+        lines = wrap_meme_lines(draw, candidate, font, stroke_width, max_width)
+        _, block_height = measure_meme_block(draw, lines, font, stroke_width, line_gap)
+        if block_height <= max_height:
+            return lines, block_height
+
+    lines = wrap_meme_lines(draw, "…", font, stroke_width, max_width)
+    _, block_height = measure_meme_block(draw, lines, font, stroke_width, line_gap)
+    if block_height <= max_height:
+        return lines, block_height
+
+    return [], 0
+
+
+def fit_meme_block(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_font_size: int,
+    min_font_size: int,
+    max_width: int,
+    max_height: int,
+) -> tuple[ImageFont.FreeTypeFont, int, int, list[str], int]:
+    if not text:
+        font, stroke_width, line_gap = get_meme_font_settings(min_font_size)
+        return font, stroke_width, line_gap, [], 0
+
+    for font_size in range(max_font_size, min_font_size - 1, -2):
+        font, stroke_width, line_gap = get_meme_font_settings(font_size)
+        lines = wrap_meme_lines(draw, text, font, stroke_width, max_width)
+        _, block_height = measure_meme_block(draw, lines, font, stroke_width, line_gap)
+        if block_height <= max_height:
+            return font, stroke_width, line_gap, lines, block_height
+
+    font, stroke_width, line_gap = get_meme_font_settings(min_font_size)
+    lines = wrap_meme_lines(draw, text, font, stroke_width, max_width)
+    _, block_height = measure_meme_block(draw, lines, font, stroke_width, line_gap)
+    if block_height > max_height:
+        lines, block_height = truncate_meme_text_to_fit(
+            draw,
+            text,
+            font,
+            stroke_width,
+            line_gap,
+            max_width,
+            max_height,
+        )
+
+    return font, stroke_width, line_gap, lines, block_height
+
+
+def draw_meme_block(
+    draw: ImageDraw.ImageDraw,
+    lines: list[str],
+    font: ImageFont.FreeTypeFont,
+    stroke_width: int,
+    line_gap: int,
+    image_width: int,
+    start_y: int,
+) -> None:
+    y = start_y
+    for line in lines:
+        bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+        line_width = bbox[2] - bbox[0]
+        line_height = bbox[3] - bbox[1]
+        x = (image_width - line_width) / 2 - bbox[0]
+        draw.text(
+            (x, y - bbox[1]),
+            line,
+            font=font,
+            fill="white",
+            stroke_width=stroke_width,
+            stroke_fill="black",
+        )
+        y += line_height + line_gap
+
+
+def render_meme_template(image_path: Path, top_text: str, bottom_text: str) -> bytes:
+    image = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(image)
     width, height = image.size
+    horizontal_padding = max(10, width // 35)
+    vertical_padding = max(10, height // 35)
+    max_text_width = max(1, width - horizontal_padding * 2)
 
-    font_size = max(24, width // 12)
-    font = ImageFont.truetype(MEME_FONT_PATH, font_size)
-    stroke_width = max(2, font_size // 15)
-    line_height = int(font_size * 1.2)
+    top = normalize_meme_text(top_text)
+    bottom = normalize_meme_text(bottom_text)
+    if not top and not bottom:
+        raise ValueError("meme caption is empty")
 
-    chars_per_line = max(10, (width // (font_size // 2 or 1)))
-    wrapped_lines = textwrap.wrap(text.upper(), width=chars_per_line) or [text.upper()]
+    max_font_size = max(24, min(width // 7, height // 5))
+    min_font_size = min(max_font_size, max(14, int(width * MEME_MIN_FONT_WIDTH_RATIO)))
+    max_block_height = max(1, int(height * MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO))
+    if top and bottom:
+        max_block_height = min(
+            max_block_height,
+            max(1, (height - vertical_padding * 3) // 2),
+        )
 
-    if len(wrapped_lines) * line_height > height * 0.6 and len(wrapped_lines) > 1:
-        split = (len(wrapped_lines) + 1) // 2
-        top_lines, bottom_lines = wrapped_lines[:split], wrapped_lines[split:]
-    else:
-        top_lines, bottom_lines = wrapped_lines, []
+    top_font, top_stroke_width, top_line_gap, top_lines, top_height = fit_meme_block(
+        draw,
+        top,
+        max_font_size,
+        min_font_size,
+        max_text_width,
+        max_block_height,
+    )
+    (
+        bottom_font,
+        bottom_stroke_width,
+        bottom_line_gap,
+        bottom_lines,
+        bottom_height,
+    ) = fit_meme_block(
+        draw,
+        bottom,
+        max_font_size,
+        min_font_size,
+        max_text_width,
+        max_block_height,
+    )
 
-    def draw_block(lines: list[str], start_y: float) -> None:
-        y = start_y
-        for line in lines:
-            bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
-            x = (width - (bbox[2] - bbox[0])) / 2
-            draw.text(
-                (x, y),
-                line,
-                font=font,
-                fill="white",
-                stroke_width=stroke_width,
-                stroke_fill="black",
-            )
-            y += line_height
-
-    draw_block(top_lines, 10)
+    if top_lines:
+        draw_meme_block(
+            draw,
+            top_lines,
+            top_font,
+            top_stroke_width,
+            top_line_gap,
+            width,
+            vertical_padding,
+        )
     if bottom_lines:
-        draw_block(bottom_lines, height - line_height * len(bottom_lines) - 10)
+        bottom_y = height - vertical_padding - bottom_height
+        draw_meme_block(
+            draw,
+            bottom_lines,
+            bottom_font,
+            bottom_stroke_width,
+            bottom_line_gap,
+            width,
+            bottom_y,
+        )
 
     buffer = BytesIO()
     image.save(buffer, format="PNG")
@@ -1147,6 +1587,32 @@ def parse_digest_json(raw_text: str) -> dict:
         cleaned = cleaned.strip()
 
     return json.loads(cleaned)
+
+
+def parse_meme_caption_json(raw_text: str) -> tuple[str, str]:
+    data = parse_digest_json(raw_text)
+    if not isinstance(data, dict):
+        raise ValueError("meme caption response must be a JSON object")
+
+    top_text = " ".join(str(data.get("top_text", "")).split()).strip()
+    bottom_text = " ".join(str(data.get("bottom_text", "")).split()).strip()
+    if not top_text and not bottom_text:
+        raise ValueError("meme caption response is empty")
+
+    return top_text, bottom_text
+
+
+def serialize_meme_caption_pair(top_text: str, bottom_text: str) -> str:
+    return json.dumps(
+        {"top_text": top_text, "bottom_text": bottom_text},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def format_meme_caption_text(top_text: str, bottom_text: str) -> str:
+    lines = [line for line in (top_text.strip(), bottom_text.strip()) if line]
+    return "\n".join(lines)
 
 
 def escape_html(text: str) -> str:
@@ -1352,6 +1818,66 @@ async def get_or_build_markov_chain(
     return chain
 
 
+async def generate_nonsense_phrase_gemini(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> str | None:
+    sample = fetch_random_messages_sample(chat_id)
+    if not sample:
+        return None
+
+    character_intro = build_character_intro(context, chat_id)
+    recent_phrases = get_recent_generated_texts(context, "recent_nonsense_phrases", chat_id)
+    prompt = NONSENSE_PROMPT_TEMPLATE.format(
+        character_intro=character_intro,
+        messages=" | ".join(sample),
+    )
+    prompt += format_recent_nonsense_phrases_instruction(recent_phrases)
+
+    try:
+        phrase = await generate_gemini_text(prompt)
+    except Exception:
+        logger.exception("nonsense reaction: Gemini error chat_id=%s", chat_id)
+        return None
+
+    phrase = " ".join(phrase.split()).strip()
+    if not phrase:
+        return None
+
+    return phrase
+
+
+async def generate_meme_caption_gemini(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    template_name: str,
+) -> tuple[str, str] | None:
+    sample = fetch_random_messages_sample(chat_id)
+    if not sample:
+        return None
+
+    character_intro = build_character_intro(context, chat_id)
+    recent_phrases = get_recent_generated_texts(context, "recent_nonsense_phrases", chat_id)
+    prompt = MEME_CAPTION_PROMPT_TEMPLATE.format(
+        character_intro=character_intro,
+        messages=" | ".join(sample),
+        template_name=template_name,
+        template_description=meme_template_description(template_name),
+    )
+    prompt += format_recent_nonsense_phrases_instruction(recent_phrases)
+
+    try:
+        raw_caption = await generate_gemini_text(prompt)
+        return parse_meme_caption_json(raw_caption)
+    except Exception:
+        logger.exception(
+            "nonsense reaction: Gemini meme caption error chat_id=%s template=%r",
+            chat_id,
+            template_name,
+        )
+        return None
+
+
 async def maybe_send_nonsense_reaction(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1369,37 +1895,53 @@ async def maybe_send_nonsense_reaction(
     if previous is not None and now - previous < cooldown:
         return
 
-    if count_chat_messages(chat_id) < get_nonsense_min_messages():
-        return
-
-    chain = await get_or_build_markov_chain(context, chat_id)
-    phrase = generate_nonsense_phrase(chain)
-    if phrase is None:
+    if count_non_bot_chat_messages(chat_id) < get_nonsense_min_messages():
         return
 
     sent_as_meme = False
-    photo_row = fetch_random_photo_media(chat_id)
-    if photo_row is not None and random.random() <= get_meme_render_chance():
-        try:
-            telegram_file = await context.bot.get_file(photo_row["file_id"])
-            image_bytes = bytes(await telegram_file.download_as_bytearray())
-            meme_bytes = render_meme(image_bytes, phrase)
-            await message.reply_photo(photo=BytesIO(meme_bytes))
-            sent_as_meme = True
-        except Exception:
-            logger.exception(
-                "nonsense reaction: meme render failed chat_id=%s, falling back to text", chat_id
-            )
+    generated_text_for_memory: str | None = None
+    template = get_random_meme_template()
+    if template is not None and random.random() <= get_meme_render_chance():
+        template_path, template_name = template
+        caption = await generate_meme_caption_gemini(context, chat_id, template_name)
+        if caption is not None:
+            top_text, bottom_text = caption
+            fallback_text = format_meme_caption_text(top_text, bottom_text)
+            generated_text_for_memory = serialize_meme_caption_pair(top_text, bottom_text)
+            if fallback_text:
+                try:
+                    meme_bytes = render_meme_template(template_path, top_text, bottom_text)
+                    await message.reply_photo(photo=BytesIO(meme_bytes))
+                    sent_as_meme = True
+                except Exception:
+                    logger.exception(
+                        "nonsense reaction: meme render failed chat_id=%s template=%s, "
+                        "falling back to text",
+                        chat_id,
+                        template_path.name,
+                    )
+                    await message.reply_text(fallback_text)
 
-    if not sent_as_meme:
+    if generated_text_for_memory is None:
+        phrase = await generate_nonsense_phrase_gemini(context, chat_id)
+        if phrase is None:
+            return
+
+        generated_text_for_memory = phrase
         await message.reply_text(phrase)
 
     last_triggered_at[chat_id] = now
+    remember_generated_text(
+        context,
+        "recent_nonsense_phrases",
+        chat_id,
+        generated_text_for_memory,
+    )
     logger.info(
-        "nonsense reaction triggered chat_id=%s kind=%s phrase=%r",
+        "nonsense reaction triggered chat_id=%s kind=%s text=%r",
         chat_id,
         "meme" if sent_as_meme else "text",
-        phrase[:200],
+        generated_text_for_memory[:200],
     )
 
 
@@ -2633,6 +3175,7 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     setup_logging()
     init_db()
+    ensure_meme_templates()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:

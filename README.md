@@ -38,6 +38,7 @@ Runtime-файлы создаются отдельно:
 ```text
 data/messages.sqlite3     # SQLite-база на хосте
 logs/bot.log              # лог-файл на хосте
+templates/                # скачанные шаблоны мемов Imgflip и index.json
 .env                      # локальные секреты и настройки
 ```
 
@@ -142,6 +143,7 @@ SQLite-база хранится на хосте:
 ```text
 ./data -> /app/data
 ./logs -> /app/logs
+./templates -> /app/templates
 ./.env -> /app/.env:ro
 ```
 
