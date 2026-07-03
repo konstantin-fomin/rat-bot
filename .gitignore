@@ -1,0 +1,19 @@
+.env
+
+# Runtime data
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.python-version
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
