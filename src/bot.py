@@ -1,3 +1,4 @@
+import asyncio
 import html
 import json
 import logging
@@ -36,6 +37,10 @@ DB_PATH = Path(os.getenv("DB_PATH", DATA_DIR / "messages.sqlite3"))
 LOG_PATH = Path(os.getenv("LOG_PATH", LOG_DIR / "bot.log"))
 NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+GEMINI_MAX_ATTEMPTS = 3
+GEMINI_RETRY_BASE_DELAY_SECONDS = 1.5
+GEMINI_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
+GEMINI_TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
 IMGFLIP_MEMES_ENDPOINT = "https://api.imgflip.com/get_memes"
 MEME_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.20
@@ -51,6 +56,7 @@ BOT_COMMANDS = [
     ("votekick", "Шуточное голосование за изгнание из чата"),
     ("horoscope", "Гороскоп чата на завтра"),
     ("stats", "Статистика чата: активность, топ участников"),
+    ("boot", "Бутнем?"),
 ]
 
 RAT_CHARACTER_INTRO = (
@@ -306,25 +312,55 @@ DIGEST_PROMPT_TEMPLATE = """{character_intro}
 """
 
 RAT_MENTION_PATTERN = re.compile(r"\bкрыс[а-яё]*\b", re.IGNORECASE)
+BOOT_TRIGGER_PATTERN = re.compile(r"^/?бут(?:@\w+)?$", re.IGNORECASE)
 
 RAT_REPLY_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Кто-то в чате только что упомянул слово 'крыса' (в каком-то виде) в сообщении: '{text}'. "
-    "Придумай короткий ОСТРЫЙ саркастичный ответ на 1-2 предложения — задиристый, "
-    "с подколом, не дружелюбный и не мягкий, а именно колкий и дерзкий. "
-    "Обыграй упоминание слова с иронией. Можно использовать нематерные оскорбления "
-    "и язвительные ярлыки. Тон должен быть язвительным, а не приветливым. "
+    "Придумай короткий ОСТРЫЙ саркастичный ответ на 1-2 предложения — дерзкий, "
+    "язвительный и ощутимо жёсткий, почти как roast, но без мата. "
+    "Обыграй упоминание слова с иронией и атакуй конкретную нелепость в исходной фразе, "
+    "а не само слово по шаблону. Можно использовать нематерные оскорбления и язвительные ярлыки. "
+    "Не смягчай концовку, не извиняйся и не превращай ответ в дружелюбную шутку. "
+    "Обязательный ракурс ответа: {style_instruction}. "
     "Ответь только текстом реплики, без кавычек и пояснений."
+)
+RAT_REPLY_STYLE_INSTRUCTIONS = (
+    "короткий разнос в стиле злого стендап-комика",
+    "сухой приговор человеку, который сам подставился словом 'крыса'",
+    "псевдонаучный диагноз по одной фразе из чата",
+    "саркастичное разоблачение трусости, суеты или подозрительности в сообщении",
+    "жёсткая бытовая метафора, будто фраза развалилась на глазах",
+    "ответ так, будто RAT поймал человека на месте преступления",
+)
+RAT_MENTION_FALLBACK_REPLIES = (
+    "Крыса на связи, просто Gemini опять ушел пить чай под нагрузкой.",
+    "Крыса услышала, но нейросеть сейчас делает вид, что ее нет дома.",
+    "Шевеление в стене зафиксировано. Остроумие временно на ручном приводе.",
 )
 
 ROAST_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Вот реальные сообщения человека по имени {name} за последнее время:\n"
     "{messages}\n"
-    "Придумай короткий дружеский roast (подкол) на основе ЭТИХ РЕАЛЬНЫХ сообщений, 2-4 предложения. "
-    "Это должно быть смешно и точно бить в характерные детали; нематерные оскорбительные "
-    "формулировки допустимы. Ответь только текстом подкола, без пояснений.\n"
+    "Придумай короткий roast (подкол) на основе ЭТИХ РЕАЛЬНЫХ сообщений, 2-4 предложения. "
+    "Тон должен быть дерзким, язвительным и чуть злее обычного дружеского подкола, но без мата. "
+    "Бей в конкретные детали, привычки, повторяющиеся слова и странные выводы человека. "
+    "Можно использовать жёсткие, но нематерные ярлыки и оскорбительные формулировки. "
+    "Не смягчай концовку и не превращай ответ в комплимент. "
+    "Обязательный ракурс этого roast: {style_instruction}. "
+    "Ответь только текстом подкола, без пояснений.\n"
     + NO_CLICHES_INSTRUCTION
+)
+ROAST_MAX_SOURCE_MESSAGES = 45
+ROAST_STYLE_INSTRUCTIONS = (
+    "сухой судебный приговор по поведению в чате",
+    "псевдонаучный диагноз по сообщениям, будто это клинический случай",
+    "жёсткое сравнение с офисной, игровой или бытовой катастрофой",
+    "короткий разнос в стиле злого стендап-комика",
+    "ироничный портрет человека, который сам себе создал проблему и гордится этим",
+    "разоблачение главной привычки человека через одну смешную деталь из сообщений",
+    "саркастичная инструкция, как стать таким же невыносимым",
 )
 
 NONSENSE_PROMPT_TEMPLATE = (
@@ -1146,8 +1182,26 @@ def format_recent_roasts_instruction(recent_roasts: list[str]) -> str:
     return (
         "\n\nВот твои последние roast-подколы в этом чате: "
         f"{' | '.join(recent_roasts)}. "
-        "НЕ повторяй эти формулировки, образы и структуру фраз — придумай новый ракурс подкола."
+        "Запрещено повторять эти формулировки, образы, сравнения, структуру фраз и главный панч. "
+        "Если тянет пошутить так же — выбери другой факт из сообщений и ударь с другого угла."
     )
+
+
+def select_roast_source_lines(rows: list[sqlite3.Row]) -> list[str]:
+    lines = [row["text"].strip() for row in rows if row["text"] and row["text"].strip()]
+    if len(lines) <= ROAST_MAX_SOURCE_MESSAGES:
+        return lines
+
+    recent_count = max(12, ROAST_MAX_SOURCE_MESSAGES // 3)
+    recent_lines = lines[-recent_count:]
+    older_lines = lines[:-recent_count]
+    sampled_older_lines = random.sample(
+        older_lines,
+        k=min(len(older_lines), ROAST_MAX_SOURCE_MESSAGES - recent_count),
+    )
+    selected_lines = sampled_older_lines + recent_lines
+    random.shuffle(selected_lines)
+    return selected_lines
 
 
 def format_recent_nonsense_phrases_instruction(recent_phrases: list[str]) -> str:
@@ -1591,20 +1645,58 @@ async def generate_gemini_text(prompt: str) -> str:
         "x-goog-api-key": api_key,
     }
 
-    async with httpx.AsyncClient(timeout=45) as client:
-        response = await client.post(url, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+        for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+            try:
+                response = await client.post(url, headers=headers, json=payload)
+            except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                if attempt >= GEMINI_MAX_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Gemini request failed after {attempt} attempts: {exc!r}"
+                    ) from exc
 
-    if response.status_code >= 400:
-        raise RuntimeError(f"Gemini API error {response.status_code}: {response.text[:500]}")
+                delay = GEMINI_RETRY_BASE_DELAY_SECONDS * attempt + random.uniform(0, 0.5)
+                logger.warning(
+                    "Gemini request failed attempt=%s/%s error=%r; retrying in %.1fs",
+                    attempt,
+                    GEMINI_MAX_ATTEMPTS,
+                    exc,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
 
-    data = response.json()
-    candidates = data.get("candidates") or []
-    parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-    text = "\n".join(part.get("text", "") for part in parts).strip()
-    if not text:
-        raise RuntimeError(f"Gemini API returned empty text: {data}")
+            if response.status_code in GEMINI_RETRY_STATUS_CODES:
+                if attempt >= GEMINI_MAX_ATTEMPTS:
+                    raise RuntimeError(
+                        f"Gemini API error {response.status_code}: {response.text[:500]}"
+                    )
 
-    return text
+                delay = GEMINI_RETRY_BASE_DELAY_SECONDS * attempt + random.uniform(0, 0.5)
+                logger.warning(
+                    "Gemini transient API error status=%s attempt=%s/%s body=%r; retrying in %.1fs",
+                    response.status_code,
+                    attempt,
+                    GEMINI_MAX_ATTEMPTS,
+                    response.text[:300],
+                    delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+
+            if response.status_code >= 400:
+                raise RuntimeError(f"Gemini API error {response.status_code}: {response.text[:500]}")
+
+            data = response.json()
+            candidates = data.get("candidates") or []
+            parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+            text = "\n".join(part.get("text", "") for part in parts).strip()
+            if not text:
+                raise RuntimeError(f"Gemini API returned empty text: {data}")
+
+            return text
+
+    raise RuntimeError("Gemini request failed without response")
 
 
 def parse_digest_json(raw_text: str) -> dict:
@@ -1733,12 +1825,37 @@ def build_morning_keyboard(count: int) -> InlineKeyboardMarkup:
     )
 
 
+def build_boot_keyboard(count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"➕ {count}", callback_data="boot:react")]]
+    )
+
+
 def prune_morning_reactions(context: ContextTypes.DEFAULT_TYPE) -> None:
     reactions: dict[int, set[int]] = context.application.bot_data.setdefault(
         "morning_reactions", {}
     )
     created_at_by_message: dict[int, datetime] = context.application.bot_data.setdefault(
         "morning_reaction_created_at", {}
+    )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+
+    expired_message_ids = [
+        message_id
+        for message_id, created_at in created_at_by_message.items()
+        if created_at < cutoff
+    ]
+    for message_id in expired_message_ids:
+        reactions.pop(message_id, None)
+        created_at_by_message.pop(message_id, None)
+
+
+def prune_boot_reactions(context: ContextTypes.DEFAULT_TYPE) -> None:
+    reactions: dict[int, set[int]] = context.application.bot_data.setdefault(
+        "boot_reactions", {}
+    )
+    created_at_by_message: dict[int, datetime] = context.application.bot_data.setdefault(
+        "boot_reaction_created_at", {}
     )
     cutoff = datetime.now(timezone.utc) - timedelta(days=1)
 
@@ -1789,6 +1906,35 @@ async def send_scheduled_morning_greeting(context: ContextTypes.DEFAULT_TYPE) ->
         logger.exception("утреннее приветствие: не удалось отправить сообщение")
 
 
+async def send_boot_prompt(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    source: str,
+) -> None:
+    prune_boot_reactions(context)
+    sent_message = await context.bot.send_message(
+        chat_id=chat_id,
+        text="Бутнем?",
+        reply_markup=build_boot_keyboard(0),
+    )
+
+    reactions: dict[int, set[int]] = context.application.bot_data.setdefault(
+        "boot_reactions", {}
+    )
+    created_at_by_message: dict[int, datetime] = context.application.bot_data.setdefault(
+        "boot_reaction_created_at", {}
+    )
+    reactions[sent_message.message_id] = set()
+    created_at_by_message[sent_message.message_id] = datetime.now(timezone.utc)
+
+    logger.info(
+        "boot prompt sent source=%s chat_id=%s message_id=%s",
+        source,
+        chat_id,
+        sent_message.message_id,
+    )
+
+
 async def maybe_reply_to_rat_mention(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1808,13 +1954,17 @@ async def maybe_reply_to_rat_mention(
     prompt = RAT_REPLY_PROMPT_TEMPLATE.format(
         character_intro=character_intro,
         text=text,
+        style_instruction=random.choice(RAT_REPLY_STYLE_INSTRUCTIONS),
     )
     prompt += format_recent_rat_replies_instruction(recent_replies)
     try:
         reply = await generate_gemini_text(prompt)
     except Exception:
         logger.exception("rat mention reply: Gemini error")
-        return False
+        fallback_reply = random.choice(RAT_MENTION_FALLBACK_REPLIES)
+        await message.reply_text(fallback_reply)
+        logger.info("rat mention fallback used text=%r reply=%r", text[:120], fallback_reply)
+        return True
 
     await message.reply_text(reply)
     remember_generated_text(context, "recent_rat_replies", chat_id, reply)
@@ -2563,6 +2713,32 @@ async def handle_morning_command(
         await message.reply_text("Не смог отправить утреннее приветствие, попробуйте позже")
 
 
+async def handle_boot_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None:
+        logger.warning("/boot ignored because CHAT_ID is empty")
+        await message.reply_text("CHAT_ID не настроен, бутнуть не получится")
+        return
+
+    if chat.id != allowed_chat_id:
+        logger.info("/boot ignored from chat_id=%s", chat.id)
+        return
+
+    try:
+        await send_boot_prompt(context, chat.id, source="manual")
+    except Exception:
+        logger.exception("/boot failed to send prompt")
+        await message.reply_text("Не смог запустить бут, попробуйте позже")
+
+
 async def handle_roast_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2649,14 +2825,16 @@ async def handle_roast_command(
         await message.reply_text("Уже подкалывали недавно, дайте человеку выдохнуть 😅")
         return
 
-    lines = [row["text"].strip() for row in rows if row["text"] and row["text"].strip()]
+    lines = select_roast_source_lines(rows)
     messages_text = "\n".join(f"- {line}" for line in lines)
     character_intro = build_character_intro(context, allowed_chat_id)
     recent_roasts = get_recent_generated_texts(context, "recent_roast_replies", allowed_chat_id)
+    style_instruction = random.choice(ROAST_STYLE_INSTRUCTIONS)
     prompt = ROAST_PROMPT_TEMPLATE.format(
         character_intro=character_intro,
         name=display_name,
         messages=messages_text,
+        style_instruction=style_instruction,
     )
     prompt += format_recent_roasts_instruction(recent_roasts)
 
@@ -2890,6 +3068,59 @@ async def handle_morning_callback(
 
     logger.info(
         "morning reaction added chat_id=%s message_id=%s user_id=%s",
+        chat.id,
+        message_id,
+        user.id,
+    )
+
+
+async def handle_boot_callback(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is None or chat is None or query.message is None:
+        return
+
+    user = query.from_user
+    if user is None:
+        await query.answer()
+        return
+
+    prune_boot_reactions(context)
+    message_id = query.message.message_id
+    reactions: dict[int, set[int]] = context.application.bot_data.setdefault(
+        "boot_reactions", {}
+    )
+    created_at_by_message: dict[int, datetime] = context.application.bot_data.setdefault(
+        "boot_reaction_created_at", {}
+    )
+    reacted_user_ids = reactions.setdefault(message_id, set())
+    created_at_by_message.setdefault(message_id, datetime.now(timezone.utc))
+
+    if user.id in reacted_user_ids:
+        await query.answer("Уже отметились ✅")
+        return
+
+    reacted_user_ids.add(user.id)
+    await query.answer("Бутнем ✅")
+
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat.id,
+            message_id=message_id,
+            reply_markup=build_boot_keyboard(len(reacted_user_ids)),
+        )
+    except Exception:
+        logger.exception(
+            "boot reaction: failed to update button chat_id=%s message_id=%s",
+            chat.id,
+            message_id,
+        )
+
+    logger.info(
+        "boot reaction added chat_id=%s message_id=%s user_id=%s",
         chat.id,
         message_id,
         user.id,
@@ -3225,14 +3456,22 @@ def main() -> None:
     application.add_handler(CommandHandler("stats", handle_stats_command))
     application.add_handler(CommandHandler("backup", handle_backup_command))
     application.add_handler(CommandHandler("morning", handle_morning_command))
+    application.add_handler(CommandHandler("boot", handle_boot_command))
+    application.add_handler(CommandHandler("but", handle_boot_command))
     application.add_handler(
         CallbackQueryHandler(handle_votekick_callback, pattern=r"^votekick:")
     )
     application.add_handler(
         CallbackQueryHandler(handle_morning_callback, pattern=r"^morning:react$")
     )
+    application.add_handler(
+        CallbackQueryHandler(handle_boot_callback, pattern=r"^boot:react$")
+    )
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo_message))
     application.add_handler(MessageHandler(filters.Sticker.ALL, handle_sticker_message))
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(BOOT_TRIGGER_PATTERN), handle_boot_command)
+    )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
