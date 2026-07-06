@@ -44,7 +44,7 @@ GEMINI_RETRY_BASE_DELAY_SECONDS = 1.5
 GEMINI_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 GEMINI_TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
 GEMINI_FAST_TIMEOUT = httpx.Timeout(connect=5.0, read=12.0, write=10.0, pool=5.0)
-GEMINI_RAT_MENTION_MAX_ATTEMPTS = 1
+GEMINI_RAT_MENTION_MAX_ATTEMPTS = 3
 IMGFLIP_MEMES_ENDPOINT = "https://api.imgflip.com/get_memes"
 MEME_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.20
@@ -1977,15 +1977,39 @@ async def maybe_reply_to_rat_mention(
         message.message_id,
         text[:120],
     )
+    fast_model = get_gemini_model("GEMINI_FAST_MODEL", DEFAULT_GEMINI_FAST_MODEL)
+    primary_model = get_gemini_model()
     try:
-        reply = await generate_gemini_text(
-            prompt,
-            max_attempts=GEMINI_RAT_MENTION_MAX_ATTEMPTS,
-            timeout=GEMINI_FAST_TIMEOUT,
-            model=get_gemini_model("GEMINI_FAST_MODEL", DEFAULT_GEMINI_FAST_MODEL),
-        )
+        try:
+            reply = await generate_gemini_text(
+                prompt,
+                max_attempts=GEMINI_RAT_MENTION_MAX_ATTEMPTS,
+                timeout=GEMINI_FAST_TIMEOUT,
+                model=fast_model,
+            )
+        except Exception as exc:
+            if primary_model == fast_model:
+                raise
+
+            logger.warning(
+                "rat mention reply: fast Gemini model failed, retrying with primary model "
+                "fast_model=%s primary_model=%s error=%r",
+                fast_model,
+                primary_model,
+                exc,
+            )
+            reply = await generate_gemini_text(
+                prompt,
+                max_attempts=1,
+                timeout=GEMINI_FAST_TIMEOUT,
+                model=primary_model,
+            )
     except Exception:
-        logger.exception("rat mention reply: Gemini error")
+        logger.exception(
+            "rat mention reply: Gemini error fast_model=%s primary_model=%s",
+            fast_model,
+            primary_model,
+        )
         fallback_reply = random.choice(RAT_MENTION_FALLBACK_REPLIES)
         await message.reply_text(fallback_reply)
         logger.info("rat mention fallback used text=%r reply=%r", text[:120], fallback_reply)
