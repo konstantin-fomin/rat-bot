@@ -41,6 +41,8 @@ GEMINI_MAX_ATTEMPTS = 3
 GEMINI_RETRY_BASE_DELAY_SECONDS = 1.5
 GEMINI_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 GEMINI_TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
+GEMINI_FAST_TIMEOUT = httpx.Timeout(connect=5.0, read=12.0, write=10.0, pool=5.0)
+GEMINI_RAT_MENTION_MAX_ATTEMPTS = 1
 IMGFLIP_MEMES_ENDPOINT = "https://api.imgflip.com/get_memes"
 MEME_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.20
@@ -1618,7 +1620,12 @@ def render_meme_template(image_path: Path, top_text: str, bottom_text: str) -> b
     return buffer.getvalue()
 
 
-async def generate_gemini_text(prompt: str) -> str:
+async def generate_gemini_text(
+    prompt: str,
+    *,
+    max_attempts: int = GEMINI_MAX_ATTEMPTS,
+    timeout: httpx.Timeout = GEMINI_TIMEOUT,
+) -> str:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is required")
@@ -1645,12 +1652,12 @@ async def generate_gemini_text(prompt: str) -> str:
         "x-goog-api-key": api_key,
     }
 
-    async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
-        for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(1, max_attempts + 1):
             try:
                 response = await client.post(url, headers=headers, json=payload)
             except (httpx.TimeoutException, httpx.NetworkError) as exc:
-                if attempt >= GEMINI_MAX_ATTEMPTS:
+                if attempt >= max_attempts:
                     raise RuntimeError(
                         f"Gemini request failed after {attempt} attempts: {exc!r}"
                     ) from exc
@@ -1659,7 +1666,7 @@ async def generate_gemini_text(prompt: str) -> str:
                 logger.warning(
                     "Gemini request failed attempt=%s/%s error=%r; retrying in %.1fs",
                     attempt,
-                    GEMINI_MAX_ATTEMPTS,
+                    max_attempts,
                     exc,
                     delay,
                 )
@@ -1667,7 +1674,7 @@ async def generate_gemini_text(prompt: str) -> str:
                 continue
 
             if response.status_code in GEMINI_RETRY_STATUS_CODES:
-                if attempt >= GEMINI_MAX_ATTEMPTS:
+                if attempt >= max_attempts:
                     raise RuntimeError(
                         f"Gemini API error {response.status_code}: {response.text[:500]}"
                     )
@@ -1677,7 +1684,7 @@ async def generate_gemini_text(prompt: str) -> str:
                     "Gemini transient API error status=%s attempt=%s/%s body=%r; retrying in %.1fs",
                     response.status_code,
                     attempt,
-                    GEMINI_MAX_ATTEMPTS,
+                    max_attempts,
                     response.text[:300],
                     delay,
                 )
@@ -1957,8 +1964,18 @@ async def maybe_reply_to_rat_mention(
         style_instruction=random.choice(RAT_REPLY_STYLE_INSTRUCTIONS),
     )
     prompt += format_recent_rat_replies_instruction(recent_replies)
+    logger.info(
+        "rat mention detected chat_id=%s message_id=%s text=%r",
+        chat_id,
+        message.message_id,
+        text[:120],
+    )
     try:
-        reply = await generate_gemini_text(prompt)
+        reply = await generate_gemini_text(
+            prompt,
+            max_attempts=GEMINI_RAT_MENTION_MAX_ATTEMPTS,
+            timeout=GEMINI_FAST_TIMEOUT,
+        )
     except Exception:
         logger.exception("rat mention reply: Gemini error")
         fallback_reply = random.choice(RAT_MENTION_FALLBACK_REPLIES)
