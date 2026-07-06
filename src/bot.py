@@ -37,6 +37,8 @@ DB_PATH = Path(os.getenv("DB_PATH", DATA_DIR / "messages.sqlite3"))
 LOG_PATH = Path(os.getenv("LOG_PATH", LOG_DIR / "bot.log"))
 NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
+DEFAULT_GEMINI_FAST_MODEL = "gemini-2.5-flash-lite"
 GEMINI_MAX_ATTEMPTS = 3
 GEMINI_RETRY_BASE_DELAY_SECONDS = 1.5
 GEMINI_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -1620,17 +1622,22 @@ def render_meme_template(image_path: Path, top_text: str, bottom_text: str) -> b
     return buffer.getvalue()
 
 
+def get_gemini_model(env_var: str = "GEMINI_MODEL", default: str = DEFAULT_GEMINI_MODEL) -> str:
+    return os.getenv(env_var, default).strip() or default
+
+
 async def generate_gemini_text(
     prompt: str,
     *,
     max_attempts: int = GEMINI_MAX_ATTEMPTS,
     timeout: httpx.Timeout = GEMINI_TIMEOUT,
+    model: str | None = None,
 ) -> str:
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is required")
 
-    model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip() or "gemini-3.5-flash"
+    model = model or get_gemini_model()
     url = GEMINI_ENDPOINT.format(model=model)
     payload = {
         "contents": [
@@ -1975,6 +1982,7 @@ async def maybe_reply_to_rat_mention(
             prompt,
             max_attempts=GEMINI_RAT_MENTION_MAX_ATTEMPTS,
             timeout=GEMINI_FAST_TIMEOUT,
+            model=get_gemini_model("GEMINI_FAST_MODEL", DEFAULT_GEMINI_FAST_MODEL),
         )
     except Exception:
         logger.exception("rat mention reply: Gemini error")

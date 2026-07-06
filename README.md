@@ -58,6 +58,7 @@ cp .env.example .env
 TELEGRAM_BOT_TOKEN=
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.5-flash
+GEMINI_FAST_MODEL=gemini-2.5-flash-lite
 CHAT_ID=
 DIGEST_TIME=21:00
 TZ=Europe/Moscow
@@ -81,7 +82,8 @@ MORNING_GREETING_TIME=07:53
 
 - `TELEGRAM_BOT_TOKEN` - токен Telegram-бота от BotFather.
 - `GEMINI_API_KEY` - ключ Gemini для генеративных команд и реакций.
-- `GEMINI_MODEL` - модель Gemini.
+- `GEMINI_MODEL` - основная модель Gemini для генеративных команд.
+- `GEMINI_FAST_MODEL` - быстрая модель Gemini только для короткой реакции на слово "крыса".
 - `CHAT_ID` - ID чата, из которого сохранять сообщения. Если пустой, бот сохраняет текстовые сообщения из всех доступных ему чатов.
 - `DIGEST_TIME` - время ежедневной сводки.
 - `TZ` - часовой пояс контейнера.
