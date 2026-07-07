@@ -59,6 +59,12 @@ TELEGRAM_BOT_TOKEN=
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.5-flash
 GEMINI_FAST_MODEL=gemini-2.5-flash-lite
+GEMINI_FALLBACK_MODELS=gemini-2.5-flash,gemini-2.5-flash-lite
+GEMINI_MAX_CONCURRENT_REQUESTS=2
+TELEGRAM_CONCURRENT_UPDATES=8
+TELEGRAM_CONNECTION_POOL_SIZE=32
+TELEGRAM_POOL_TIMEOUT=10
+SQLITE_TIMEOUT_SECONDS=30
 CHAT_ID=
 DIGEST_TIME=21:00
 TZ=Europe/Moscow
@@ -84,6 +90,11 @@ MORNING_GREETING_TIME=07:53
 - `GEMINI_API_KEY` - ключ Gemini для генеративных команд и реакций.
 - `GEMINI_MODEL` - основная модель Gemini для генеративных команд.
 - `GEMINI_FAST_MODEL` - быстрая модель Gemini только для короткой реакции на слово "крыса".
+- `GEMINI_FALLBACK_MODELS` - модели через запятую, которые пробуются только если основная модель не ответила.
+- `GEMINI_MAX_CONCURRENT_REQUESTS` - общий лимит одновременных запросов к Gemini.
+- `TELEGRAM_CONCURRENT_UPDATES` - сколько апдейтов Telegram бот может обрабатывать параллельно.
+- `TELEGRAM_CONNECTION_POOL_SIZE` и `TELEGRAM_POOL_TIMEOUT` - размер и таймаут пула HTTP-соединений Telegram SDK.
+- `SQLITE_TIMEOUT_SECONDS` - сколько секунд SQLite ждёт снятия краткой блокировки базы.
 - `CHAT_ID` - ID чата, из которого сохранять сообщения. Если пустой, бот сохраняет текстовые сообщения из всех доступных ему чатов.
 - `DIGEST_TIME` - время ежедневной сводки.
 - `TZ` - часовой пояс контейнера.

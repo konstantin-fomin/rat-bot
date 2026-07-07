@@ -39,27 +39,42 @@ NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_GEMINI_FAST_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
+DEFAULT_GEMINI_MAX_CONCURRENT_REQUESTS = 2
 GEMINI_MAX_ATTEMPTS = 3
 GEMINI_RETRY_BASE_DELAY_SECONDS = 1.5
+GEMINI_RETRY_MAX_DELAY_SECONDS = 20.0
 GEMINI_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 GEMINI_TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
 GEMINI_FAST_TIMEOUT = httpx.Timeout(connect=5.0, read=12.0, write=10.0, pool=5.0)
 GEMINI_RAT_MENTION_MAX_ATTEMPTS = 3
+GEMINI_ROAST_MAX_ATTEMPTS = 2
+GEMINI_ROAST_TIMEOUT = httpx.Timeout(connect=8.0, read=45.0, write=20.0, pool=5.0)
+DEFAULT_TELEGRAM_CONCURRENT_UPDATES = 8
+DEFAULT_TELEGRAM_CONNECTION_POOL_SIZE = 32
+DEFAULT_TELEGRAM_POOL_TIMEOUT = 10.0
+DEFAULT_SQLITE_TIMEOUT_SECONDS = 30.0
+BOOT_FOLLOWUP_DELAY_SECONDS = 180
 IMGFLIP_MEMES_ENDPOINT = "https://api.imgflip.com/get_memes"
 MEME_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.20
 MEME_MIN_FONT_WIDTH_RATIO = 0.05
 MEME_SAFE_TEXT_PATTERN = re.compile(r"[^а-яА-ЯёЁa-zA-Z0-9\s.,!?—\-:;()]")
+LOCAL_ROAST_UNSAFE_WORD_PATTERN = re.compile(
+    r"\b(?:бля\w*|хуй\w*|хуе\w*|пизд\w*|еба\w*|ёба\w*|уеб\w*|уёб\w*|заеб\w*)\b",
+    re.IGNORECASE,
+)
 MEME_TEMPLATE_LIMIT = 20
 MEME_TEMPLATE_INDEX_PATH = TEMPLATES_DIR / "index.json"
 MEME_TEMPLATE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 BOT_COMMANDS = [
     ("digest", "Собрать сводку дня (спойлер: будет больно)"),
-    ("roast", "Подколоть друга по его сообщениям: /roast @username"),
-    ("votekick", "Шуточное голосование за изгнание из чата"),
+    ("roast", "Диагноз по сообщениям в чате"),
+    ("votekick", "Слово чату: терпим или нет"),
     ("horoscope", "Гороскоп чата на завтра"),
     ("stats", "Статистика чата: активность, топ участников"),
+    ("morning", "Прислать утреннее приветствие"),
     ("boot", "Бутнем?"),
 ]
 
@@ -295,6 +310,12 @@ NO_CLICHES_INSTRUCTION = (
     "цепляйся за конкретные слова, цифры и детали из реальных сообщений. "
     "Чем конкретнее и неожиданнее шутка — тем лучше."
 )
+AUTHORSHIP_INSTRUCTION = (
+    "Точно соблюдай авторство: никогда не приписывай слова одного человека другому. "
+    "Используй только реальные фразы и факты из предоставленных сообщений — не выдумывай "
+    "и не додумывай детали, которых там нет. Если не уверен, кто именно сказал ту или иную "
+    "фразу, или сомневаешься в достоверности детали — лучше не используй её вообще, чем угадывать."
+)
 
 DIGEST_PROMPT_TEMPLATE = """{character_intro}
 На основе сообщений за день собери саркастичную сводку.
@@ -337,12 +358,6 @@ RAT_REPLY_STYLE_INSTRUCTIONS = (
     "жёсткая бытовая метафора, будто фраза развалилась на глазах",
     "ответ так, будто RAT поймал человека на месте преступления",
 )
-RAT_MENTION_FALLBACK_REPLIES = (
-    "Крыса на связи, просто Gemini опять ушел пить чай под нагрузкой.",
-    "Крыса услышала, но нейросеть сейчас делает вид, что ее нет дома.",
-    "Шевеление в стене зафиксировано. Остроумие временно на ручном приводе.",
-)
-
 ROAST_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Вот реальные сообщения человека по имени {name} за последнее время:\n"
@@ -459,6 +474,8 @@ VOTEKICK_SPARED_PROMPT_TEMPLATE = (
 
 
 logger = logging.getLogger(__name__)
+_gemini_semaphore: asyncio.Semaphore | None = None
+_gemini_semaphore_limit: int | None = None
 
 
 def meme_template_description(template_name: str) -> str:
@@ -844,10 +861,18 @@ def load_name_map() -> dict[str, str]:
     return names
 
 
+def connect_db(path: Path = DB_PATH) -> sqlite3.Connection:
+    timeout = get_positive_float_env("SQLITE_TIMEOUT_SECONDS", DEFAULT_SQLITE_TIMEOUT_SECONDS)
+    connection = sqlite3.connect(path, timeout=timeout)
+    connection.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+    return connection
+
+
 def init_db() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -858,6 +883,7 @@ def init_db() -> None:
                 display_name TEXT,
                 text TEXT NOT NULL,
                 message_datetime TEXT NOT NULL,
+                reply_to_message_id INTEGER,
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (message_id, chat_id)
             )
@@ -869,6 +895,8 @@ def init_db() -> None:
         }
         if "is_bot" not in existing_columns:
             connection.execute("ALTER TABLE messages ADD COLUMN is_bot INTEGER NOT NULL DEFAULT 0")
+        if "reply_to_message_id" not in existing_columns:
+            connection.execute("ALTER TABLE messages ADD COLUMN reply_to_message_id INTEGER")
 
         connection.execute(
             """
@@ -901,6 +929,16 @@ def init_db() -> None:
             """
         )
 
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS processed_updates (
+                update_id INTEGER PRIMARY KEY,
+                handler TEXT NOT NULL,
+                processed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
         connection.commit()
 
 
@@ -917,23 +955,37 @@ def get_today_bounds_utc(tz: ZoneInfo) -> tuple[str, str]:
 def fetch_today_messages(chat_id: int, tz: ZoneInfo) -> list[sqlite3.Row]:
     start_utc, end_utc = get_today_bounds_utc(tz)
 
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(
             """
-            SELECT user_id, username, display_name, text, message_datetime
-            FROM messages
-            WHERE chat_id = ?
-              AND message_datetime >= ?
-              AND message_datetime <= ?
-            ORDER BY message_datetime ASC, message_id ASC
+            SELECT
+                message.message_id,
+                message.user_id,
+                message.username,
+                message.display_name,
+                message.text,
+                message.message_datetime,
+                message.reply_to_message_id,
+                reply.user_id AS reply_user_id,
+                reply.username AS reply_username,
+                reply.display_name AS reply_display_name,
+                reply.text AS reply_text
+            FROM messages AS message
+            LEFT JOIN messages AS reply
+              ON reply.chat_id = message.chat_id
+             AND reply.message_id = message.reply_to_message_id
+            WHERE message.chat_id = ?
+              AND message.message_datetime >= ?
+              AND message.message_datetime <= ?
+            ORDER BY message.message_datetime ASC, message.message_id ASC
             """,
             (chat_id, start_utc, end_utc),
         ).fetchall()
 
 
 def resolve_user_id_by_username(chat_id: int, username: str) -> int | None:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             """
@@ -952,7 +1004,7 @@ def resolve_user_id_by_username(chat_id: int, username: str) -> int | None:
 
 
 def fetch_latest_display_name(chat_id: int, user_id: int) -> str | None:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         row = connection.execute(
             """
@@ -977,32 +1029,27 @@ def fetch_user_messages(
     username: str | None,
     since_utc: str | None,
 ) -> list[sqlite3.Row]:
-    if user_id is not None:
-        where_clause = "chat_id = ? AND user_id = ?"
-        params: list = [chat_id, user_id]
-    elif username:
-        where_clause = "chat_id = ? AND lower(username) = lower(?)"
-        params = [chat_id, username]
-    else:
+    if user_id is None:
         return []
 
     query = f"""
         SELECT user_id, username, display_name, text, message_datetime
         FROM messages
-        WHERE {where_clause}
+        WHERE chat_id = ? AND user_id = ?
     """
+    params: list = [chat_id, user_id]
     if since_utc is not None:
         query += " AND message_datetime >= ?"
         params.append(since_utc)
     query += " ORDER BY message_datetime ASC, message_id ASC"
 
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(query, params).fetchall()
 
 
 def count_chat_messages(chat_id: int) -> int:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         row = connection.execute(
             "SELECT COUNT(*) FROM messages WHERE chat_id = ?",
             (chat_id,),
@@ -1012,7 +1059,7 @@ def count_chat_messages(chat_id: int) -> int:
 
 
 def count_non_bot_chat_messages(chat_id: int) -> int:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         row = connection.execute(
             """
             SELECT COUNT(*)
@@ -1028,7 +1075,7 @@ def count_non_bot_chat_messages(chat_id: int) -> int:
 
 
 def fetch_all_chat_texts(chat_id: int) -> list[str]:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
@@ -1048,7 +1095,7 @@ def fetch_random_messages_sample(chat_id: int, n: int = 1) -> list[str]:
     if n <= 0:
         return []
 
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
@@ -1074,7 +1121,7 @@ def fetch_random_messages_sample(chat_id: int, n: int = 1) -> list[str]:
 def extract_chat_slang(chat_id: int) -> list[str]:
     since_utc = (datetime.now(timezone.utc) - timedelta(days=SLANG_LOOKBACK_DAYS)).isoformat()
 
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
@@ -1131,7 +1178,7 @@ def get_or_extract_chat_slang(context: ContextTypes.DEFAULT_TYPE, chat_id: int) 
 
 def build_character_intro(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> str:
     slang_words = get_or_extract_chat_slang(context, chat_id)
-    base_intro = f"{RAT_CHARACTER_INTRO}\n{NO_PROFANITY_INSTRUCTION}"
+    base_intro = f"{RAT_CHARACTER_INTRO}\n{NO_PROFANITY_INSTRUCTION}\n{AUTHORSHIP_INSTRUCTION}"
     if not slang_words:
         return base_intro
 
@@ -1208,6 +1255,34 @@ def select_roast_source_lines(rows: list[sqlite3.Row]) -> list[str]:
     return selected_lines
 
 
+def sanitize_local_roast_detail(text: str) -> str:
+    cleaned = " ".join(text.split()).strip()
+    cleaned = LOCAL_ROAST_UNSAFE_WORD_PATTERN.sub("[реплика из чата]", cleaned)
+    if len(cleaned) > 90:
+        cleaned = cleaned[:87].rstrip() + "..."
+
+    return cleaned
+
+
+def build_local_roast_fallback(name: str, lines: list[str]) -> str:
+    details = []
+    for line in lines[-12:]:
+        detail = sanitize_local_roast_detail(line)
+        if detail:
+            details.append(detail)
+
+    detail = random.choice(details) if details else "очередной след в истории чата"
+    templates = (
+        "{name}, Gemini сейчас лег под нагрузкой, но база улик не молчит. После фразы «{detail}» "
+        "даже автосводка выглядит как серьезная аналитика, а не попытка чата собрать мысль по частям.",
+        "{name}, внешний мозг временно недоступен, поэтому приговор короткий: «{detail}» уже само "
+        "по себе звучит как заявка на отдельную папку в архиве странных решений.",
+        "{name}, нейросеть не ответила, зато история чата справилась без нее. «{detail}» — это тот "
+        "случай, когда подкол не генерируют, а аккуратно достают из протокола.",
+    )
+    return random.choice(templates).format(name=name, detail=detail)
+
+
 def format_recent_nonsense_phrases_instruction(recent_phrases: list[str]) -> str:
     if not recent_phrases:
         return ""
@@ -1219,22 +1294,55 @@ def format_recent_nonsense_phrases_instruction(recent_phrases: list[str]) -> str
     )
 
 
-def get_author_name(row: sqlite3.Row, name_map: dict[str, str]) -> str:
-    username = row["username"]
+def get_author_name(
+    row: sqlite3.Row,
+    name_map: dict[str, str],
+    *,
+    prefix: str = "",
+) -> str:
+    username = row[f"{prefix}username"]
     if username:
         mapped_name = name_map.get(username.lower())
         if mapped_name:
             return mapped_name
 
-    return row["display_name"] or username or f"user_{row['user_id']}"
+    user_id = row[f"{prefix}user_id"]
+    return row[f"{prefix}display_name"] or username or f"user_{user_id}"
+
+
+def format_reply_excerpt(text: str, limit: int = 90) -> str:
+    excerpt = " ".join(text.split()).strip()
+    if len(excerpt) > limit:
+        excerpt = excerpt[: limit - 3].rstrip() + "..."
+
+    return excerpt
 
 
 def build_messages_transcript(messages: list[sqlite3.Row], name_map: dict[str, str]) -> str:
-    lines = [
-        f"{get_author_name(row, name_map)}: {row['text'].strip()}"
-        for row in messages
-        if row["text"] and row["text"].strip()
-    ]
+    lines = []
+    for row in messages:
+        text = row["text"].strip() if row["text"] else ""
+        if not text:
+            continue
+
+        author_name = get_author_name(row, name_map)
+        reply_text = row["reply_text"] if "reply_text" in row.keys() else None
+        if (
+            row["reply_to_message_id"] is not None
+            and reply_text
+            and (
+                row["reply_user_id"] is not None
+                or row["reply_username"]
+                or row["reply_display_name"]
+            )
+        ):
+            reply_author_name = get_author_name(row, name_map, prefix="reply_")
+            reply_excerpt = format_reply_excerpt(reply_text)
+            lines.append(
+                f"{author_name} (в ответ {reply_author_name}: '{reply_excerpt}'): {text}"
+            )
+        else:
+            lines.append(f"{author_name}: {text}")
 
     return "\n".join(lines)
 
@@ -1265,7 +1373,7 @@ def build_horoscope_request(
 
 
 def save_daily_digest(chat_id: int, date_str: str, digest_data: dict) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.execute(
             """
             INSERT OR REPLACE INTO daily_digests (
@@ -1292,7 +1400,7 @@ def fetch_weekly_digests(chat_id: int, tz: ZoneInfo) -> list[sqlite3.Row]:
     start_date = (today - timedelta(days=6)).isoformat()
     end_date = today.isoformat()
 
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(
             """
@@ -1622,8 +1730,93 @@ def render_meme_template(image_path: Path, top_text: str, bottom_text: str) -> b
     return buffer.getvalue()
 
 
+def get_positive_int_env(env_var: str, default: int) -> int:
+    raw = os.getenv(env_var, str(default)).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; using default %s", env_var, raw, default)
+        return default
+
+    if value <= 0:
+        logger.warning("invalid %s=%r; using default %s", env_var, raw, default)
+        return default
+
+    return value
+
+
+def get_positive_float_env(env_var: str, default: float) -> float:
+    raw = os.getenv(env_var, str(default)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("invalid %s=%r; using default %s", env_var, raw, default)
+        return default
+
+    if value <= 0:
+        logger.warning("invalid %s=%r; using default %s", env_var, raw, default)
+        return default
+
+    return value
+
+
 def get_gemini_model(env_var: str = "GEMINI_MODEL", default: str = DEFAULT_GEMINI_MODEL) -> str:
     return os.getenv(env_var, default).strip() or default
+
+
+def get_gemini_fallback_models(env_var: str = "GEMINI_FALLBACK_MODELS") -> list[str]:
+    raw = os.getenv(env_var, "").strip()
+    if raw:
+        models = [model.strip() for model in raw.split(",") if model.strip()]
+    else:
+        models = list(DEFAULT_GEMINI_FALLBACK_MODELS)
+
+    primary_model = get_gemini_model()
+    return [model for model in models if model != primary_model]
+
+
+def get_gemini_model_candidates(
+    *,
+    primary_model: str | None = None,
+    fallback_models: list[str] | None = None,
+) -> list[str]:
+    candidates = [primary_model or get_gemini_model()]
+    candidates.extend(fallback_models if fallback_models is not None else get_gemini_fallback_models())
+
+    deduped: list[str] = []
+    for model in candidates:
+        if model and model not in deduped:
+            deduped.append(model)
+
+    return deduped
+
+
+def get_gemini_semaphore() -> asyncio.Semaphore:
+    global _gemini_semaphore, _gemini_semaphore_limit
+
+    limit = get_positive_int_env(
+        "GEMINI_MAX_CONCURRENT_REQUESTS",
+        DEFAULT_GEMINI_MAX_CONCURRENT_REQUESTS,
+    )
+    if _gemini_semaphore is None or _gemini_semaphore_limit != limit:
+        _gemini_semaphore = asyncio.Semaphore(limit)
+        _gemini_semaphore_limit = limit
+        logger.info("Gemini concurrency limit set to %s", limit)
+
+    return _gemini_semaphore
+
+
+def get_retry_delay(response: httpx.Response | None, attempt: int) -> float:
+    if response is not None:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return min(float(retry_after), GEMINI_RETRY_MAX_DELAY_SECONDS)
+            except ValueError:
+                pass
+
+    delay = GEMINI_RETRY_BASE_DELAY_SECONDS * attempt + random.uniform(0, 0.5)
+    return min(delay, GEMINI_RETRY_MAX_DELAY_SECONDS)
 
 
 async def generate_gemini_text(
@@ -1659,7 +1852,8 @@ async def generate_gemini_text(
         "x-goog-api-key": api_key,
     }
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    semaphore = get_gemini_semaphore()
+    async with semaphore, httpx.AsyncClient(timeout=timeout) as client:
         for attempt in range(1, max_attempts + 1):
             try:
                 response = await client.post(url, headers=headers, json=payload)
@@ -1669,7 +1863,7 @@ async def generate_gemini_text(
                         f"Gemini request failed after {attempt} attempts: {exc!r}"
                     ) from exc
 
-                delay = GEMINI_RETRY_BASE_DELAY_SECONDS * attempt + random.uniform(0, 0.5)
+                delay = get_retry_delay(None, attempt)
                 logger.warning(
                     "Gemini request failed attempt=%s/%s error=%r; retrying in %.1fs",
                     attempt,
@@ -1686,7 +1880,7 @@ async def generate_gemini_text(
                         f"Gemini API error {response.status_code}: {response.text[:500]}"
                     )
 
-                delay = GEMINI_RETRY_BASE_DELAY_SECONDS * attempt + random.uniform(0, 0.5)
+                delay = get_retry_delay(response, attempt)
                 logger.warning(
                     "Gemini transient API error status=%s attempt=%s/%s body=%r; retrying in %.1fs",
                     response.status_code,
@@ -1711,6 +1905,33 @@ async def generate_gemini_text(
             return text
 
     raise RuntimeError("Gemini request failed without response")
+
+
+async def generate_gemini_text_with_fallback(
+    prompt: str,
+    *,
+    max_attempts: int = GEMINI_MAX_ATTEMPTS,
+    timeout: httpx.Timeout = GEMINI_TIMEOUT,
+    primary_model: str | None = None,
+    fallback_models: list[str] | None = None,
+) -> str:
+    last_error: Exception | None = None
+    for model in get_gemini_model_candidates(
+        primary_model=primary_model,
+        fallback_models=fallback_models,
+    ):
+        try:
+            return await generate_gemini_text(
+                prompt,
+                max_attempts=max_attempts,
+                timeout=timeout,
+                model=model,
+            )
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Gemini model failed model=%s error=%r", model, exc)
+
+    raise RuntimeError("all Gemini model candidates failed") from last_error
 
 
 def parse_digest_json(raw_text: str) -> dict:
@@ -1949,6 +2170,36 @@ async def send_boot_prompt(
     )
 
 
+async def send_boot_followup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = context.job.chat_id
+    if chat_id is None:
+        logger.warning("boot follow-up skipped: job has no chat_id")
+        return
+
+    await context.bot.send_message(chat_id=chat_id, text="Бутнули, проверяйте")
+    logger.info("boot follow-up sent chat_id=%s", chat_id)
+
+
+def schedule_boot_followup(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    source: str,
+) -> None:
+    job = context.application.job_queue.run_once(
+        send_boot_followup,
+        when=BOOT_FOLLOWUP_DELAY_SECONDS,
+        chat_id=chat_id,
+        name=f"boot_followup_{chat_id}_{datetime.now(timezone.utc).timestamp()}",
+    )
+    logger.info(
+        "boot follow-up scheduled source=%s chat_id=%s delay_seconds=%s job_name=%s",
+        source,
+        chat_id,
+        BOOT_FOLLOWUP_DELAY_SECONDS,
+        job.name,
+    )
+
+
 async def maybe_reply_to_rat_mention(
     message: Message,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2010,9 +2261,6 @@ async def maybe_reply_to_rat_mention(
             fast_model,
             primary_model,
         )
-        fallback_reply = random.choice(RAT_MENTION_FALLBACK_REPLIES)
-        await message.reply_text(fallback_reply)
-        logger.info("rat mention fallback used text=%r reply=%r", text[:120], fallback_reply)
         return True
 
     await message.reply_text(reply)
@@ -2181,10 +2429,11 @@ def save_message(
     display_name: str | None,
     text: str,
     message_datetime: str,
+    reply_to_message_id: int | None,
     is_bot: bool,
-) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
-        connection.execute(
+) -> bool:
+    with closing(connect_db()) as connection:
+        cursor = connection.execute(
             """
             INSERT OR IGNORE INTO messages (
                 message_id,
@@ -2194,9 +2443,10 @@ def save_message(
                 display_name,
                 text,
                 message_datetime,
+                reply_to_message_id,
                 is_bot
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 message_id,
@@ -2206,10 +2456,12 @@ def save_message(
                 display_name,
                 text,
                 message_datetime,
+                reply_to_message_id,
                 int(is_bot),
             ),
         )
         connection.commit()
+        return cursor.rowcount > 0
 
 
 def save_media(
@@ -2222,7 +2474,7 @@ def save_media(
     file_unique_id: str,
     media_date: str,
 ) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.execute(
             """
             INSERT INTO media (
@@ -2249,8 +2501,42 @@ def save_media(
         connection.commit()
 
 
+def mark_update_processed_once(
+    update: Update,
+    handler: str,
+) -> bool:
+    update_id = update.update_id
+    if update_id is None:
+        logger.warning("%s update has no update_id; processing without duplicate guard", handler)
+        return True
+
+    message = update.effective_message
+    chat = update.effective_chat
+    with closing(connect_db()) as connection:
+        cursor = connection.execute(
+            """
+            INSERT OR IGNORE INTO processed_updates (update_id, handler, processed_at)
+            VALUES (?, ?, ?)
+            """,
+            (update_id, handler, datetime.now(timezone.utc).isoformat()),
+        )
+        connection.commit()
+
+    if cursor.rowcount == 0:
+        logger.info(
+            "%s duplicate update ignored update_id=%s chat_id=%s message_id=%s",
+            handler,
+            update_id,
+            chat.id if chat else None,
+            message.message_id if message else None,
+        )
+        return False
+
+    return True
+
+
 def fetch_random_photo_media(chat_id: int) -> sqlite3.Row | None:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(
             """
@@ -2304,7 +2590,7 @@ def fetch_chat_stats(chat_id: int, tz: ZoneInfo, name_map: dict[str, str]) -> di
     seven_days_ago_utc = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     non_bot_clause = "(is_bot IS NULL OR is_bot = 0)"
 
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
 
         total_messages = connection.execute(
@@ -2550,6 +2836,23 @@ def format_stats_html(stats: dict, tz: ZoneInfo) -> str:
     )
 
 
+async def handle_text_reactions(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+) -> None:
+    try:
+        rat_triggered = await maybe_reply_to_rat_mention(message, context)
+        if not rat_triggered:
+            await maybe_send_nonsense_reaction(message, context, chat_id)
+    except Exception:
+        logger.exception(
+            "text reaction task failed chat_id=%s message_id=%s",
+            chat_id,
+            message.message_id,
+        )
+
+
 async def handle_text_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -2567,8 +2870,13 @@ async def handle_text_message(
 
     message_datetime = message.date.astimezone(timezone.utc).isoformat()
     display_name = user.full_name if user else None
+    reply_to_message_id = (
+        message.reply_to_message.message_id
+        if message.reply_to_message is not None
+        else None
+    )
 
-    save_message(
+    inserted = save_message(
         message_id=message.message_id,
         chat_id=chat.id,
         user_id=user.id if user else None,
@@ -2576,8 +2884,18 @@ async def handle_text_message(
         display_name=display_name,
         text=message.text,
         message_datetime=message_datetime,
+        reply_to_message_id=reply_to_message_id,
         is_bot=bool(user.is_bot) if user else False,
     )
+    if not inserted:
+        logger.info(
+            "duplicate message ignored chat_id=%s message_id=%s user_id=%s text=%r",
+            chat.id,
+            message.message_id,
+            user.id if user else None,
+            message.text[:120],
+        )
+        return
 
     logger.info(
         "saved message chat_id=%s message_id=%s user_id=%s text=%r",
@@ -2587,9 +2905,11 @@ async def handle_text_message(
         message.text[:120],
     )
 
-    rat_triggered = await maybe_reply_to_rat_mention(message, context)
-    if not rat_triggered:
-        await maybe_send_nonsense_reaction(message, context, chat.id)
+    context.application.create_task(
+        handle_text_reactions(message, context, chat.id),
+        update=update,
+        name=f"text-reactions:{chat.id}:{message.message_id}",
+    )
 
 
 async def handle_photo_message(
@@ -2672,6 +2992,8 @@ async def handle_digest_command(
     chat = update.effective_chat
     if message is None or chat is None:
         return
+    if not mark_update_processed_once(update, "/digest"):
+        return
 
     allowed_chat_id = get_allowed_chat_id()
     if allowed_chat_id is None:
@@ -2718,6 +3040,8 @@ async def handle_stats_command(
     user = update.effective_user
     if message is None or chat is None:
         return
+    if not mark_update_processed_once(update, "/stats"):
+        return
 
     allowed_chat_id = get_allowed_chat_id()
     if allowed_chat_id is not None and chat.id != allowed_chat_id:
@@ -2743,6 +3067,8 @@ async def handle_morning_command(
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat is None:
+        return
+    if not mark_update_processed_once(update, "/morning"):
         return
 
     allowed_chat_id = get_allowed_chat_id()
@@ -2770,6 +3096,8 @@ async def handle_boot_command(
     chat = update.effective_chat
     if message is None or chat is None:
         return
+    if not mark_update_processed_once(update, "/boot"):
+        return
 
     allowed_chat_id = get_allowed_chat_id()
     if allowed_chat_id is None:
@@ -2783,6 +3111,7 @@ async def handle_boot_command(
 
     try:
         await send_boot_prompt(context, chat.id, source="manual")
+        schedule_boot_followup(context, chat.id, source="manual")
     except Exception:
         logger.exception("/boot failed to send prompt")
         await message.reply_text("Не смог запустить бут, попробуйте позже")
@@ -2795,6 +3124,8 @@ async def handle_roast_command(
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat is None:
+        return
+    if not mark_update_processed_once(update, "/roast"):
         return
 
     allowed_chat_id = get_allowed_chat_id()
@@ -2888,11 +3219,14 @@ async def handle_roast_command(
     prompt += format_recent_roasts_instruction(recent_roasts)
 
     try:
-        roast_text = await generate_gemini_text(prompt)
+        roast_text = await generate_gemini_text_with_fallback(
+            prompt,
+            max_attempts=GEMINI_ROAST_MAX_ATTEMPTS,
+            timeout=GEMINI_ROAST_TIMEOUT,
+        )
     except Exception:
         logger.exception("/roast failed to generate for target_user_id=%s", roast_key)
-        await message.reply_text("Не смог придумать подкол, попробуйте позже")
-        return
+        roast_text = build_local_roast_fallback(display_name, lines)
 
     roast_last_at[roast_key] = now
     await message.reply_text(roast_text)
@@ -2912,6 +3246,8 @@ async def handle_votekick_command(
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat is None:
+        return
+    if not mark_update_processed_once(update, "/votekick"):
         return
 
     allowed_chat_id = get_allowed_chat_id()
@@ -3249,6 +3585,8 @@ async def handle_horoscope_command(
     chat = update.effective_chat
     if message is None or chat is None:
         return
+    if not mark_update_processed_once(update, "/horoscope"):
+        return
 
     allowed_chat_id = get_allowed_chat_id()
     if allowed_chat_id is None:
@@ -3294,6 +3632,8 @@ async def handle_weekly_command(
     message = update.effective_message
     chat = update.effective_chat
     if message is None or chat is None:
+        return
+    if not mark_update_processed_once(update, "/weekly"):
         return
 
     allowed_chat_id = get_allowed_chat_id()
@@ -3390,7 +3730,7 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def count_all_messages() -> int:
-    with closing(sqlite3.connect(DB_PATH)) as connection:
+    with closing(connect_db()) as connection:
         row = connection.execute("SELECT COUNT(*) FROM messages").fetchone()
 
     return row[0] if row else 0
@@ -3399,7 +3739,7 @@ def count_all_messages() -> int:
 def create_db_backup(dest_dir: Path) -> Path:
     backup_path = dest_dir / f"messages-backup-{datetime.now(timezone.utc):%Y%m%d-%H%M%S}.sqlite3"
 
-    source = sqlite3.connect(DB_PATH)
+    source = connect_db()
     try:
         target = sqlite3.connect(backup_path)
         try:
@@ -3454,6 +3794,8 @@ async def handle_backup_command(
     chat = update.effective_chat
     if message is None or chat is None:
         return
+    if not mark_update_processed_once(update, "/backup"):
+        return
 
     allowed_chat_id = get_allowed_chat_id()
     if allowed_chat_id is not None and chat.id != allowed_chat_id:
@@ -3495,7 +3837,33 @@ def main() -> None:
     else:
         logger.info("bot will save text messages from chat_id=%s", allowed_chat_id)
 
-    application = Application.builder().token(token).post_init(post_init).build()
+    concurrent_updates = get_positive_int_env(
+        "TELEGRAM_CONCURRENT_UPDATES",
+        DEFAULT_TELEGRAM_CONCURRENT_UPDATES,
+    )
+    connection_pool_size = get_positive_int_env(
+        "TELEGRAM_CONNECTION_POOL_SIZE",
+        DEFAULT_TELEGRAM_CONNECTION_POOL_SIZE,
+    )
+    pool_timeout = get_positive_float_env(
+        "TELEGRAM_POOL_TIMEOUT",
+        DEFAULT_TELEGRAM_POOL_TIMEOUT,
+    )
+    application = (
+        Application.builder()
+        .token(token)
+        .post_init(post_init)
+        .concurrent_updates(concurrent_updates)
+        .connection_pool_size(connection_pool_size)
+        .pool_timeout(pool_timeout)
+        .build()
+    )
+    logger.info(
+        "Telegram concurrency configured updates=%s connection_pool_size=%s pool_timeout=%s",
+        concurrent_updates,
+        connection_pool_size,
+        pool_timeout,
+    )
     application.bot_data["name_map"] = load_name_map()
     application.add_handler(CommandHandler("digest", handle_digest_command))
     application.add_handler(CommandHandler("roast", handle_roast_command))
