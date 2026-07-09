@@ -362,25 +362,40 @@ ROAST_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Вот реальные сообщения человека по имени {name} за последнее время:\n"
     "{messages}\n"
-    "Придумай короткий roast (подкол) на основе ЭТИХ РЕАЛЬНЫХ сообщений, 2-4 предложения. "
+    "Придумай короткий roast (подкол) на основе ЭТИХ РЕАЛЬНЫХ сообщений. "
+    "Каждый вариант подкола — максимум 1-2 коротких предложения. Это не рассказ и не перечисление "
+    "фактов, а один точный укол. "
     "Тон должен быть дерзким, язвительным и чуть злее обычного дружеского подкола, но без мата. "
     "Бей в конкретные детали, привычки, повторяющиеся слова и странные выводы человека. "
+    "Из всех предоставленных сообщений выбери ТОЛЬКО ОДНУ, максимум ДВЕ самые яркие, характерные "
+    "детали или цитаты — и построй ВЕСЬ подкол вокруг них. НЕ пытайся упомянуть много разных "
+    "тем/цитат из истории человека в одном варианте — это делает шутку рассыпчатой и нечитаемой. "
+    "Лучше один точный укол в одну деталь, чем список фактов. "
+    "Не обвешивай текст кавычками с дословными вставками из сообщений — вместо этого перескажи "
+    "характерную деталь своими словами, естественно вплетя её в шутку. Кавычки уместны максимум "
+    "один раз на весь подкол, если это действительно важно процитировать дословно. "
     "Можно использовать жёсткие, но нематерные ярлыки и оскорбительные формулировки. "
     "Не смягчай концовку и не превращай ответ в комплимент. "
-    "Обязательный ракурс этого roast: {style_instruction}. "
-    "Ответь только текстом подкола, без пояснений.\n"
+    "Не используй готовые архетипы или роли (детектив, прокрастинатор, и подобные шаблонные ярлыки) — "
+    "подкол должен вырастать ИЗ КОНКРЕТНЫХ деталей и слов именно этого человека, а не подгонять его "
+    "под уже готовый образ. Каждый подкол должен быть уникальным для конкретных сообщений, а не "
+    "собранным по шаблону. "
+    "Придумай 3 РАЗНЫХ варианта подкола. Для best-of-3 'разные углы' означает разные ПРИЁМЫ ЮМОРА "
+    "(например, гипербола, неожиданный вывод, ирония) применительно к ОДНОЙ и той же выбранной "
+    "детали, а не три подкола про три разные темы. Все три кандидата должны отталкиваться от одного "
+    "и того же анкера, просто обыгрывать его по-разному. "
+    "Затем оцени их сам и выбери самый смешной, оригинальный и точно бьющий в детали — как опытный "
+    "комик выбирает лучший панчлайн из черновиков. "
+    "Верни ТОЛЬКО валидный JSON, без markdown-обёртки (без ```), без каких-либо пояснений или текста "
+    "до и после JSON, строго такой структуры:\n"
+    "{{\n"
+    '  "candidates": ["вариант 1", "вариант 2", "вариант 3"],\n'
+    '  "best_index": 0,\n'
+    '  "reason": "коротко почему этот смешнее"\n'
+    "}}\n"
     + NO_CLICHES_INSTRUCTION
 )
 ROAST_MAX_SOURCE_MESSAGES = 45
-ROAST_STYLE_INSTRUCTIONS = (
-    "сухой судебный приговор по поведению в чате",
-    "псевдонаучный диагноз по сообщениям, будто это клинический случай",
-    "жёсткое сравнение с офисной, игровой или бытовой катастрофой",
-    "короткий разнос в стиле злого стендап-комика",
-    "ироничный портрет человека, который сам себе создал проблему и гордится этим",
-    "разоблачение главной привычки человека через одну смешную деталь из сообщений",
-    "саркастичная инструкция, как стать таким же невыносимым",
-)
 
 NONSENSE_PROMPT_TEMPLATE = (
     "{character_intro}\n"
@@ -1957,6 +1972,38 @@ def parse_meme_caption_json(raw_text: str) -> tuple[str, str]:
     return top_text, bottom_text
 
 
+def parse_roast_choice_json(raw_text: str) -> tuple[str, dict]:
+    data = parse_digest_json(raw_text)
+    if not isinstance(data, dict):
+        raise ValueError("roast response must be a JSON object")
+
+    raw_candidates = data.get("candidates")
+    if not isinstance(raw_candidates, list) or len(raw_candidates) != 3:
+        raise ValueError("roast response must contain exactly 3 candidates")
+
+    candidates = []
+    for candidate in raw_candidates:
+        if not isinstance(candidate, str):
+            raise ValueError("roast candidates must be strings")
+        cleaned_candidate = " ".join(candidate.split()).strip()
+        if not cleaned_candidate:
+            raise ValueError("roast candidates must not be empty")
+        candidates.append(cleaned_candidate)
+
+    best_index = data.get("best_index")
+    if isinstance(best_index, bool) or not isinstance(best_index, int):
+        raise ValueError("roast best_index must be an integer")
+    if best_index < 0 or best_index >= len(candidates):
+        raise ValueError("roast best_index is out of range")
+
+    choice = {
+        "candidates": candidates,
+        "best_index": best_index,
+        "reason": " ".join(str(data.get("reason", "")).split()).strip(),
+    }
+    return candidates[best_index], choice
+
+
 def serialize_meme_caption_pair(top_text: str, bottom_text: str) -> str:
     return json.dumps(
         {"top_text": top_text, "bottom_text": bottom_text},
@@ -3209,20 +3256,26 @@ async def handle_roast_command(
     messages_text = "\n".join(f"- {line}" for line in lines)
     character_intro = build_character_intro(context, allowed_chat_id)
     recent_roasts = get_recent_generated_texts(context, "recent_roast_replies", allowed_chat_id)
-    style_instruction = random.choice(ROAST_STYLE_INSTRUCTIONS)
     prompt = ROAST_PROMPT_TEMPLATE.format(
         character_intro=character_intro,
         name=display_name,
         messages=messages_text,
-        style_instruction=style_instruction,
     )
     prompt += format_recent_roasts_instruction(recent_roasts)
 
     try:
-        roast_text = await generate_gemini_text_with_fallback(
+        raw_roast = await generate_gemini_text_with_fallback(
             prompt,
             max_attempts=GEMINI_ROAST_MAX_ATTEMPTS,
             timeout=GEMINI_ROAST_TIMEOUT,
+        )
+        roast_text, roast_choice = parse_roast_choice_json(raw_roast)
+        logger.info(
+            "/roast best-of-3 target_user_id=%s best_index=%s reason=%r candidates=%s",
+            roast_key,
+            roast_choice["best_index"],
+            roast_choice["reason"],
+            json.dumps(roast_choice["candidates"], ensure_ascii=False),
         )
     except Exception:
         logger.exception("/roast failed to generate for target_user_id=%s", roast_key)
