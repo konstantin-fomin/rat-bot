@@ -2408,7 +2408,7 @@ async def generate_nonsense_phrase_gemini(
     prompt += format_recent_nonsense_phrases_instruction(recent_phrases)
 
     try:
-        phrase = await generate_gemini_text(prompt)
+        phrase = await generate_gemini_text_with_fallback(prompt)
     except Exception:
         logger.exception("nonsense reaction: Gemini error chat_id=%s", chat_id)
         return None
@@ -2440,7 +2440,7 @@ async def generate_meme_caption_gemini(
     prompt += format_recent_nonsense_phrases_instruction(recent_phrases)
 
     try:
-        raw_caption = await generate_gemini_text(prompt)
+        raw_caption = await generate_gemini_text_with_fallback(prompt)
         return parse_meme_caption_json(raw_caption)
     except Exception:
         logger.exception(
@@ -3116,7 +3116,7 @@ async def handle_digest_command(
     prompt = build_digest_request(rows, name_map, character_intro)
 
     try:
-        raw_digest = await generate_gemini_text(prompt)
+        raw_digest = await generate_gemini_text_with_fallback(prompt)
         digest_data = parse_digest_json(raw_digest)
     except Exception:
         logger.exception("failed to generate digest with Gemini")
@@ -3671,7 +3671,7 @@ async def finish_votekick(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> N
 
     verdict = "кикнут" if kicked else "помилован"
     try:
-        result_text = await generate_gemini_text(prompt)
+        result_text = await generate_gemini_text_with_fallback(prompt)
     except Exception:
         logger.exception("/votekick failed to generate outcome text chat_id=%s", chat_id)
         result_text = f"Голосование завершено: {target_name} {verdict} ({kick_count}:{spare_count})"
@@ -3722,7 +3722,7 @@ async def handle_horoscope_command(
     prompt = build_horoscope_request(rows, name_map, names, character_intro)
 
     try:
-        raw_horoscope = await generate_gemini_text(prompt)
+        raw_horoscope = await generate_gemini_text_with_fallback(prompt)
         horoscope_data = parse_digest_json(raw_horoscope)
     except Exception:
         logger.exception("/horoscope failed to generate")
@@ -3764,7 +3764,7 @@ async def handle_weekly_command(
         return
 
     try:
-        raw_weekly = await generate_gemini_text(prompt)
+        raw_weekly = await generate_gemini_text_with_fallback(prompt)
         weekly_data = parse_digest_json(raw_weekly)
     except Exception:
         logger.exception("/weekly failed to generate")
@@ -3793,7 +3793,7 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     prompt = build_digest_request(rows, name_map, character_intro)
 
     try:
-        raw_digest = await generate_gemini_text(prompt)
+        raw_digest = await generate_gemini_text_with_fallback(prompt)
         digest_data = parse_digest_json(raw_digest)
     except Exception:
         logger.exception("автосводка: ошибка при обращении к Gemini")
@@ -3826,7 +3826,7 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        raw_weekly = await generate_gemini_text(prompt)
+        raw_weekly = await generate_gemini_text_with_fallback(prompt)
         weekly_data = parse_digest_json(raw_weekly)
     except Exception:
         logger.exception("недельный дайджест: ошибка при обращении к Gemini")
