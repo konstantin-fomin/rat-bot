@@ -39,6 +39,7 @@ NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
 DEFAULT_GEMINI_FAST_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_DAILY_DIGEST_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
 DEFAULT_GEMINI_MAX_CONCURRENT_REQUESTS = 2
 GEMINI_MAX_ATTEMPTS = 3
@@ -3791,9 +3792,25 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     character_intro = build_character_intro(context, allowed_chat_id)
     prompt = build_digest_request(rows, name_map, character_intro)
+    daily_digest_model = get_gemini_model(
+        "GEMINI_DAILY_DIGEST_MODEL",
+        DEFAULT_GEMINI_DAILY_DIGEST_MODEL,
+    )
+    fallback_models = get_gemini_model_candidates()
+    logger.info(
+        "автосводка: порядок моделей=%s",
+        get_gemini_model_candidates(
+            primary_model=daily_digest_model,
+            fallback_models=fallback_models,
+        ),
+    )
 
     try:
-        raw_digest = await generate_gemini_text_with_fallback(prompt)
+        raw_digest = await generate_gemini_text_with_fallback(
+            prompt,
+            primary_model=daily_digest_model,
+            fallback_models=fallback_models,
+        )
         digest_data = parse_digest_json(raw_digest)
     except Exception:
         logger.exception("автосводка: ошибка при обращении к Gemini")
