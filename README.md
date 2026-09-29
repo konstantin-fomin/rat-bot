@@ -82,7 +82,6 @@ MEME_RENDER_CHANCE=0.4
 SLANG_REFRESH_HOURS=24
 BACKUP_CHAT_ID=
 BACKUP_TIME=04:00
-WEEKLY_DIGEST_TIME=21:30
 ```
 
 Описание:
@@ -92,7 +91,7 @@ WEEKLY_DIGEST_TIME=21:30
 - `GEMINI_MODEL` - основная модель Gemini для генеративных команд.
 - `GEMINI_FAST_MODEL` - быстрая модель Gemini для коротких реакций.
 - `GEMINI_DAILY_DIGEST_MODEL` - первая модель для ежедневной сводки (авто и `/digest`); после неё бот пробует резервные модели.
-- `GEMINI_WEEKLY_DIGEST_MODEL` - первая модель для недельного дайджеста (авто и `/weekly`); после неё бот пробует резервные модели.
+- `GEMINI_WEEKLY_DIGEST_MODEL` - первая модель для недельного дайджеста (`/weekly`); после неё бот пробует резервные модели.
 - `GEMINI_ROAST_MODEL` - первая модель для команды `/roast`; после неё бот пробует резервные модели.
 - `GEMINI_FALLBACK_MODELS` - модели через запятую, которые пробуются только если основная модель не ответила.
 - `GEMINI_MAX_CONCURRENT_REQUESTS` - общий лимит одновременных запросов к Gemini.
@@ -110,7 +109,6 @@ WEEKLY_DIGEST_TIME=21:30
 - `MEME_RENDER_CHANCE` - шанс отправить случайную фразу как мем на сохраненном фото.
 - `SLANG_REFRESH_HOURS` - период обновления словаря сленга чата.
 - `BACKUP_CHAT_ID` и `BACKUP_TIME` - чат и время для автобэкапа базы.
-- `WEEKLY_DIGEST_TIME` - время пятничного дайджеста недели.
 
 `/stats` использует только SQLite и не обращается к Gemini, поэтому работает без расхода внешних API.
 

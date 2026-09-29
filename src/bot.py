@@ -756,22 +756,6 @@ def get_backup_time(tz: ZoneInfo) -> time | None:
     return time(hour=hour, minute=minute, tzinfo=tz)
 
 
-def get_weekly_digest_time(tz: ZoneInfo) -> time | None:
-    raw = os.getenv("WEEKLY_DIGEST_TIME", "").strip()
-    if not raw:
-        return None
-
-    try:
-        hour_str, minute_str = raw.split(":", 1)
-        hour, minute = int(hour_str), int(minute_str)
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError
-    except ValueError as exc:
-        raise RuntimeError(f"WEEKLY_DIGEST_TIME must be in HH:MM format, got {raw!r}") from exc
-
-    return time(hour=hour, minute=minute, tzinfo=tz)
-
-
 def get_roast_cooldown() -> timedelta:
     raw = os.getenv("ROAST_COOLDOWN_MINUTES", "10").strip()
     try:
@@ -3833,37 +3817,6 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
-    allowed_chat_id = get_allowed_chat_id()
-    if allowed_chat_id is None:
-        logger.warning("недельный дайджест пропущен: CHAT_ID не настроен")
-        return
-
-    character_intro = build_character_intro(context, allowed_chat_id)
-    prompt = build_weekly_digest(allowed_chat_id, character_intro)
-    if prompt is None:
-        logger.info("недельный дайджест пропущен: нет данных за неделю")
-        return
-
-    try:
-        raw_weekly = await generate_gemini_text_for_task(
-            prompt,
-            model_env="GEMINI_WEEKLY_DIGEST_MODEL",
-            model_default=DEFAULT_GEMINI_WEEKLY_DIGEST_MODEL,
-        )
-        weekly_data = parse_digest_json(raw_weekly)
-    except Exception:
-        logger.exception("недельный дайджест: ошибка при обращении к Gemini")
-        return
-
-    await context.bot.send_message(
-        chat_id=allowed_chat_id,
-        text=format_weekly_digest_html(weekly_data),
-        parse_mode="HTML",
-    )
-    logger.info("недельный дайджест отправлен chat_id=%s", allowed_chat_id)
-
-
 def count_all_messages() -> int:
     with closing(connect_db()) as connection:
         row = connection.execute("SELECT COUNT(*) FROM messages").fetchone()
@@ -4050,19 +4003,6 @@ def main() -> None:
             "автобэкап не запланирован: BACKUP_CHAT_ID=%s BACKUP_TIME=%s",
             backup_chat_id,
             os.getenv("BACKUP_TIME", ""),
-        )
-
-    weekly_digest_time = get_weekly_digest_time(tz)
-    if allowed_chat_id is not None and weekly_digest_time is not None:
-        application.job_queue.run_daily(
-            send_weekly_digest, time=weekly_digest_time, days=(5,), name="weekly_digest"
-        )
-        logger.info("недельный дайджест запланирован на пятницу %s (%s)", weekly_digest_time, tz)
-    else:
-        logger.warning(
-            "недельный дайджест не запланирован: CHAT_ID=%s WEEKLY_DIGEST_TIME=%s",
-            allowed_chat_id,
-            os.getenv("WEEKLY_DIGEST_TIME", ""),
         )
 
     logger.info("bot started")
