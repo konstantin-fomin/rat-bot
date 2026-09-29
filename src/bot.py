@@ -37,10 +37,12 @@ DB_PATH = Path(os.getenv("DB_PATH", DATA_DIR / "messages.sqlite3"))
 LOG_PATH = Path(os.getenv("LOG_PATH", LOG_DIR / "bot.log"))
 NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-DEFAULT_GEMINI_MODEL = "gemini-3.5-flash"
-DEFAULT_GEMINI_FAST_MODEL = "gemini-2.5-flash-lite"
-DEFAULT_GEMINI_DAILY_DIGEST_MODEL = "gemini-3.1-pro-preview"
-DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.5-flash-lite")
+DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
+DEFAULT_GEMINI_FAST_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_GEMINI_DAILY_DIGEST_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_WEEKLY_DIGEST_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_ROAST_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_FALLBACK_MODELS = ("gemini-3.6-flash", "gemini-3.5-flash-lite")
 DEFAULT_GEMINI_MAX_CONCURRENT_REQUESTS = 2
 GEMINI_MAX_ATTEMPTS = 3
 GEMINI_RETRY_BASE_DELAY_SECONDS = 1.5
@@ -766,22 +768,6 @@ def get_weekly_digest_time(tz: ZoneInfo) -> time | None:
             raise ValueError
     except ValueError as exc:
         raise RuntimeError(f"WEEKLY_DIGEST_TIME must be in HH:MM format, got {raw!r}") from exc
-
-    return time(hour=hour, minute=minute, tzinfo=tz)
-
-
-def get_morning_greeting_time(tz: ZoneInfo) -> time | None:
-    raw = os.getenv("MORNING_GREETING_TIME", "").strip()
-    if not raw:
-        return None
-
-    try:
-        hour_str, minute_str = raw.split(":", 1)
-        hour, minute = int(hour_str), int(minute_str)
-        if not (0 <= hour <= 23 and 0 <= minute <= 59):
-            raise ValueError
-    except ValueError as exc:
-        raise RuntimeError(f"MORNING_GREETING_TIME must be in HH:MM format, got {raw!r}") from exc
 
     return time(hour=hour, minute=minute, tzinfo=tz)
 
@@ -2000,6 +1986,34 @@ async def generate_gemini_text_with_fallback(
     raise RuntimeError("all Gemini model candidates failed") from last_error
 
 
+async def generate_gemini_text_for_task(
+    prompt: str,
+    *,
+    model_env: str,
+    model_default: str,
+    max_attempts: int = GEMINI_MAX_ATTEMPTS,
+    timeout: httpx.Timeout = GEMINI_TIMEOUT,
+) -> str:
+    """Сгенерировать текст под конкретную задачу с её основной моделью и общими фолбэками."""
+    primary_model = get_gemini_model(model_env, model_default)
+    fallback_models = get_gemini_model_candidates()
+    logger.info(
+        "%s: порядок моделей=%s",
+        model_env,
+        get_gemini_model_candidates(
+            primary_model=primary_model,
+            fallback_models=fallback_models,
+        ),
+    )
+    return await generate_gemini_text_with_fallback(
+        prompt,
+        max_attempts=max_attempts,
+        timeout=timeout,
+        primary_model=primary_model,
+        fallback_models=fallback_models,
+    )
+
+
 def parse_digest_json(raw_text: str) -> dict:
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
@@ -2230,13 +2244,6 @@ async def send_morning_greeting(context: ContextTypes.DEFAULT_TYPE, source: str)
         allowed_chat_id,
         sent_message.message_id,
     )
-
-
-async def send_scheduled_morning_greeting(context: ContextTypes.DEFAULT_TYPE) -> None:
-    try:
-        await send_morning_greeting(context, source="scheduled")
-    except Exception:
-        logger.exception("утреннее приветствие: не удалось отправить сообщение")
 
 
 async def send_boot_prompt(
@@ -2941,9 +2948,8 @@ async def handle_text_reactions(
     chat_id: int,
 ) -> None:
     try:
-        rat_triggered = await maybe_reply_to_rat_mention(message, context)
-        if not rat_triggered:
-            await maybe_send_nonsense_reaction(message, context, chat_id)
+        # Реакция на слово «крыса» отключена.
+        await maybe_send_nonsense_reaction(message, context, chat_id)
     except Exception:
         logger.exception(
             "text reaction task failed chat_id=%s message_id=%s",
@@ -3117,7 +3123,11 @@ async def handle_digest_command(
     prompt = build_digest_request(rows, name_map, character_intro)
 
     try:
-        raw_digest = await generate_gemini_text_with_fallback(prompt)
+        raw_digest = await generate_gemini_text_for_task(
+            prompt,
+            model_env="GEMINI_DAILY_DIGEST_MODEL",
+            model_default=DEFAULT_GEMINI_DAILY_DIGEST_MODEL,
+        )
         digest_data = parse_digest_json(raw_digest)
     except Exception:
         logger.exception("failed to generate digest with Gemini")
@@ -3322,8 +3332,10 @@ async def handle_roast_command(
     prompt += format_recent_roasts_instruction(recent_roasts)
 
     try:
-        raw_roast = await generate_gemini_text_with_fallback(
+        raw_roast = await generate_gemini_text_for_task(
             prompt,
+            model_env="GEMINI_ROAST_MODEL",
+            model_default=DEFAULT_GEMINI_ROAST_MODEL,
             max_attempts=GEMINI_ROAST_MAX_ATTEMPTS,
             timeout=GEMINI_ROAST_TIMEOUT,
         )
@@ -3765,7 +3777,11 @@ async def handle_weekly_command(
         return
 
     try:
-        raw_weekly = await generate_gemini_text_with_fallback(prompt)
+        raw_weekly = await generate_gemini_text_for_task(
+            prompt,
+            model_env="GEMINI_WEEKLY_DIGEST_MODEL",
+            model_default=DEFAULT_GEMINI_WEEKLY_DIGEST_MODEL,
+        )
         weekly_data = parse_digest_json(raw_weekly)
     except Exception:
         logger.exception("/weekly failed to generate")
@@ -3792,24 +3808,11 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     character_intro = build_character_intro(context, allowed_chat_id)
     prompt = build_digest_request(rows, name_map, character_intro)
-    daily_digest_model = get_gemini_model(
-        "GEMINI_DAILY_DIGEST_MODEL",
-        DEFAULT_GEMINI_DAILY_DIGEST_MODEL,
-    )
-    fallback_models = get_gemini_model_candidates()
-    logger.info(
-        "автосводка: порядок моделей=%s",
-        get_gemini_model_candidates(
-            primary_model=daily_digest_model,
-            fallback_models=fallback_models,
-        ),
-    )
-
     try:
-        raw_digest = await generate_gemini_text_with_fallback(
+        raw_digest = await generate_gemini_text_for_task(
             prompt,
-            primary_model=daily_digest_model,
-            fallback_models=fallback_models,
+            model_env="GEMINI_DAILY_DIGEST_MODEL",
+            model_default=DEFAULT_GEMINI_DAILY_DIGEST_MODEL,
         )
         digest_data = parse_digest_json(raw_digest)
     except Exception:
@@ -3843,7 +3846,11 @@ async def send_weekly_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     try:
-        raw_weekly = await generate_gemini_text_with_fallback(prompt)
+        raw_weekly = await generate_gemini_text_for_task(
+            prompt,
+            model_env="GEMINI_WEEKLY_DIGEST_MODEL",
+            model_default=DEFAULT_GEMINI_WEEKLY_DIGEST_MODEL,
+        )
         weekly_data = parse_digest_json(raw_weekly)
     except Exception:
         logger.exception("недельный дайджест: ошибка при обращении к Gemini")
@@ -4048,7 +4055,7 @@ def main() -> None:
     weekly_digest_time = get_weekly_digest_time(tz)
     if allowed_chat_id is not None and weekly_digest_time is not None:
         application.job_queue.run_daily(
-            send_weekly_digest, time=weekly_digest_time, days=(4,), name="weekly_digest"
+            send_weekly_digest, time=weekly_digest_time, days=(5,), name="weekly_digest"
         )
         logger.info("недельный дайджест запланирован на пятницу %s (%s)", weekly_digest_time, tz)
     else:
@@ -4056,21 +4063,6 @@ def main() -> None:
             "недельный дайджест не запланирован: CHAT_ID=%s WEEKLY_DIGEST_TIME=%s",
             allowed_chat_id,
             os.getenv("WEEKLY_DIGEST_TIME", ""),
-        )
-
-    morning_greeting_time = get_morning_greeting_time(tz)
-    if allowed_chat_id is not None and morning_greeting_time is not None:
-        application.job_queue.run_daily(
-            send_scheduled_morning_greeting,
-            time=morning_greeting_time,
-            name="morning_greeting",
-        )
-        logger.info("утреннее приветствие запланировано на %s (%s)", morning_greeting_time, tz)
-    else:
-        logger.warning(
-            "утреннее приветствие не запланировано: CHAT_ID=%s MORNING_GREETING_TIME=%s",
-            allowed_chat_id,
-            os.getenv("MORNING_GREETING_TIME", ""),
         )
 
     logger.info("bot started")

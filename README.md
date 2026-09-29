@@ -13,8 +13,7 @@ Telegram-бот на Python, который сохраняет сообщени�
 - запись короткой строки в лог для каждого сохраненного сообщения;
 - команды `/digest`, `/roast`, `/votekick`, `/horoscope`, `/stats`;
 - команда `/stats` для мгновенной статистики по сохраненным данным без Gemini;
-- реакция на упоминание слова "крыса" через общий образ персонажа и сленг чата;
-- in-memory память последних сгенерированных ответов для реакции на "крысу" и `/roast`, чтобы снижать повторы;
+- in-memory память последних сгенерированных ответов для `/roast`, чтобы снижать повторы;
 - хранение базы и логов на хосте через Docker volume mounts.
 
 ## Структура проекта
@@ -57,10 +56,12 @@ cp .env.example .env
 ```env
 TELEGRAM_BOT_TOKEN=
 GEMINI_API_KEY=
-GEMINI_MODEL=gemini-3.5-flash
-GEMINI_FAST_MODEL=gemini-2.5-flash-lite
-GEMINI_DAILY_DIGEST_MODEL=gemini-3.1-pro-preview
-GEMINI_FALLBACK_MODELS=gemini-2.5-flash,gemini-2.5-flash-lite
+GEMINI_MODEL=gemini-3.6-flash
+GEMINI_FAST_MODEL=gemini-3.5-flash-lite
+GEMINI_DAILY_DIGEST_MODEL=gemini-3.8-flash
+GEMINI_WEEKLY_DIGEST_MODEL=gemini-3.8-flash
+GEMINI_ROAST_MODEL=gemini-3.8-flash
+GEMINI_FALLBACK_MODELS=gemini-3.6-flash,gemini-3.5-flash-lite
 GEMINI_MAX_CONCURRENT_REQUESTS=2
 TELEGRAM_CONCURRENT_UPDATES=8
 TELEGRAM_CONNECTION_POOL_SIZE=32
@@ -82,7 +83,6 @@ SLANG_REFRESH_HOURS=24
 BACKUP_CHAT_ID=
 BACKUP_TIME=04:00
 WEEKLY_DIGEST_TIME=21:30
-MORNING_GREETING_TIME=07:53
 ```
 
 Описание:
@@ -90,8 +90,10 @@ MORNING_GREETING_TIME=07:53
 - `TELEGRAM_BOT_TOKEN` - токен Telegram-бота от BotFather.
 - `GEMINI_API_KEY` - ключ Gemini для генеративных команд и реакций.
 - `GEMINI_MODEL` - основная модель Gemini для генеративных команд.
-- `GEMINI_FAST_MODEL` - быстрая модель Gemini только для короткой реакции на слово "крыса".
-- `GEMINI_DAILY_DIGEST_MODEL` - первая модель только для автоматической ежедневной сводки; после неё бот пробует `GEMINI_MODEL` и резервные модели.
+- `GEMINI_FAST_MODEL` - быстрая модель Gemini для коротких реакций.
+- `GEMINI_DAILY_DIGEST_MODEL` - первая модель для ежедневной сводки (авто и `/digest`); после неё бот пробует резервные модели.
+- `GEMINI_WEEKLY_DIGEST_MODEL` - первая модель для недельного дайджеста (авто и `/weekly`); после неё бот пробует резервные модели.
+- `GEMINI_ROAST_MODEL` - первая модель для команды `/roast`; после неё бот пробует резервные модели.
 - `GEMINI_FALLBACK_MODELS` - модели через запятую, которые пробуются только если основная модель не ответила.
 - `GEMINI_MAX_CONCURRENT_REQUESTS` - общий лимит одновременных запросов к Gemini.
 - `TELEGRAM_CONCURRENT_UPDATES` - сколько апдейтов Telegram бот может обрабатывать параллельно.
@@ -109,7 +111,6 @@ MORNING_GREETING_TIME=07:53
 - `SLANG_REFRESH_HOURS` - период обновления словаря сленга чата.
 - `BACKUP_CHAT_ID` и `BACKUP_TIME` - чат и время для автобэкапа базы.
 - `WEEKLY_DIGEST_TIME` - время пятничного дайджеста недели.
-- `MORNING_GREETING_TIME` - время утреннего приветствия.
 
 `/stats` использует только SQLite и не обращается к Gemini, поэтому работает без расхода внешних API.
 
