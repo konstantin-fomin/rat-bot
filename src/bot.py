@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 from collections import Counter, defaultdict
 from contextlib import closing
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
@@ -72,7 +72,7 @@ MEME_TEMPLATE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 BOT_COMMANDS = [
     ("wisdom", "Мудрость из Притч и Екклесиаста"),
     ("verse", "Стих из Библии"),
-    ("roast", "Дружеский шарж по сообщениям в чате"),
+    ("roast", "Подколоть по-доброму по сообщениям в чате"),
     ("votekick", "Слово чату: терпим или нет"),
     ("stats", "Статистика чата: активность, топ участников"),
     ("morning", "Прислать утреннее приветствие"),
@@ -368,41 +368,26 @@ DIGEST_WISDOM_OPTIONS = 12
 WEEKDAY_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
 REPENTANCE_ANNOUNCEMENT_KEY = "repentance_announcement_v1"
 REPENTANCE_ANNOUNCEMENT_TEXT = (
-    "🐀 <b>Объявление от RAT</b>\n"
+    "Всем привет 🐀\n"
     "\n"
-    "Друзья, мне надо кое-что сказать.\n"
+    "Я тут перечитал свои старые подколы и, честно, местами стало стыдно. "
+    "Так что решил стать добрее. Шутить не перестану, просто без злобы.\n"
     "\n"
-    "Я долго был в этом чате штатным прожарщиком: язвил, раздавал ярлыки, жарил всех без разбора. "
-    "Смеялись, да. Но недавно я перечитал свои старые подколы и понял, что гордиться там особо нечем.\n"
+    "А ещё я теперь знаю пару цитат получше своих. Напишите /мудрость, и я достану что-нибудь "
+    "из Притч Соломона или Екклесиаста. А /стих пришлёт строчку из Библии. "
+    "Там, кстати, местами пожёстче, чем я когда-то был 😅\n"
     "\n"
-    "Короче, я покаялся. 🙏\n"
-    "\n"
-    "Что меняется:\n"
-    "• шутить не перестану, но теперь по-доброму, без унижений;\n"
-    "• /roast теперь не прожарка, а дружеский шарж;\n"
-    "• /wisdom (или /мудрость) — мудрость из Притч Соломона и Екклесиаста;\n"
-    "• /verse (или /стих) — стих из Библии;\n"
-    "• в вечерней сводке появится мудрость дня, а по воскресеньям утром — слово на неделю.\n"
-    "\n"
-    "Цитаты настоящие, из Нового русского перевода, ни слова не выдумано. "
-    "Если по старой памяти захочется жести — загляните в /wisdom: Соломон местами жжёт похлеще меня.\n"
-    "\n"
-    "<i>Слова опрометчивых ранят, как меч,\n"
-    "а речь мудрых – исцеляет.</i>\n"
-    "— Притчи 12:18 (НРП)\n"
-    "\n"
-    "До мудрости мне пока далеко, но с мечом я завязал.\n"
-    "Ваш исправляющийся RAT"
+    "Ваш RAT"
 )
 
 ROAST_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Вот реальные сообщения человека по имени {name} за последнее время:\n"
     "{messages}\n"
-    "Придумай короткий дружеский шарж (добрый подкол) на основе ЭТИХ РЕАЛЬНЫХ сообщений. "
+    "Придумай короткий дружеский подкол на основе ЭТИХ РЕАЛЬНЫХ сообщений. "
     "Длина — на твоё усмотрение, главное чтобы был один цельный панчлайн, а не перечисление фактов. "
     "Тон — остроумный и тёплый: смеёмся над забавными привычками, словечками и ситуациями, "
-    "но не над достоинством человека. Шарж должен быть таким, чтобы его хотелось переслать маме, "
+    "но не над достоинством человека. Подкол должен быть таким, чтобы его хотелось переслать маме, "
     "а не таким, после которого обижаются. "
     "Из всех предоставленных сообщений выбери ТОЛЬКО ОДНУ самую яркую, характерную деталь или цитату "
     "как общий анкер для всех трёх кандидатов — и построй каждый подкол вокруг неё. НЕ пытайся "
@@ -1027,10 +1012,9 @@ def set_bot_state(key: str, value: str) -> None:
         connection.commit()
 
 
-def get_today_bounds_utc(tz: ZoneInfo) -> tuple[str, str]:
-    now_local = datetime.now(tz)
-    start_local = datetime.combine(now_local.date(), time.min, tzinfo=tz)
-    end_local = datetime.combine(now_local.date(), time.max, tzinfo=tz)
+def get_day_bounds_utc(day: date, tz: ZoneInfo) -> tuple[str, str]:
+    start_local = datetime.combine(day, time.min, tzinfo=tz)
+    end_local = datetime.combine(day, time.max, tzinfo=tz)
     return (
         start_local.astimezone(timezone.utc).isoformat(),
         end_local.astimezone(timezone.utc).isoformat(),
@@ -1038,7 +1022,11 @@ def get_today_bounds_utc(tz: ZoneInfo) -> tuple[str, str]:
 
 
 def fetch_today_messages(chat_id: int, tz: ZoneInfo) -> list[sqlite3.Row]:
-    start_utc, end_utc = get_today_bounds_utc(tz)
+    return fetch_messages_for_day(chat_id, tz, datetime.now(tz).date())
+
+
+def fetch_messages_for_day(chat_id: int, tz: ZoneInfo, day: date) -> list[sqlite3.Row]:
+    start_utc, end_utc = get_day_bounds_utc(day, tz)
 
     with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
@@ -1358,7 +1346,7 @@ def build_local_roast_fallback(name: str, lines: list[str]) -> str:
     templates = (
         "{name}, Gemini сейчас прилёг отдохнуть, но архив чата не молчит. Фраза «{detail}» "
         "уже заслуживает отдельной рамочки на стене чата.",
-        "{name}, внешний мозг временно недоступен, поэтому шарж короткий: «{detail}» — "
+        "{name}, внешний мозг временно недоступен, поэтому подкол короткий: «{detail}» — "
         "и этим всё сказано, причём с любовью.",
         "{name}, нейросеть не ответила, зато история чата справилась сама. «{detail}» — "
         "фраза, которую хочется процитировать на твоём юбилее.",
@@ -2644,7 +2632,7 @@ def format_quiet_duration(duration: timedelta) -> str:
 
 
 def fetch_chat_stats(chat_id: int, tz: ZoneInfo, name_map: dict[str, str]) -> dict:
-    today_start_utc, today_end_utc = get_today_bounds_utc(tz)
+    today_start_utc, today_end_utc = get_day_bounds_utc(datetime.now(tz).date(), tz)
     seven_days_ago_utc = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
     non_bot_clause = "(is_bot IS NULL OR is_bot = 0)"
 
