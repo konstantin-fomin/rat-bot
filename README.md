@@ -41,7 +41,6 @@ Runtime-файлы создаются отдельно:
 ```text
 data/messages.sqlite3     # SQLite-база на хосте
 logs/bot.log              # лог-файл на хосте
-templates/                # скачанные шаблоны мемов Imgflip и index.json
 .env                      # локальные секреты и настройки
 ```
 
@@ -77,11 +76,6 @@ ROAST_COOLDOWN_MINUTES=10
 ROAST_LOOKBACK_DAYS=14
 VOTEKICK_COOLDOWN_MINUTES=15
 VOTEKICK_DURATION_MINUTES=5
-NONSENSE_CHAIN_REFRESH_MINUTES=60
-NONSENSE_REACTION_CHANCE=0.03
-NONSENSE_COOLDOWN_MINUTES=30
-NONSENSE_MIN_MESSAGES=300
-MEME_RENDER_CHANCE=0.4
 SLANG_REFRESH_HOURS=24
 BACKUP_CHAT_ID=
 BACKUP_TIME=04:00
@@ -110,12 +104,10 @@ REPENTANCE_ANNOUNCEMENT=1
 - `ROAST_LOOKBACK_DAYS` - сколько дней истории брать для `/roast`.
 - `VOTEKICK_COOLDOWN_MINUTES` - кулдаун шуточного голосования для одного участника.
 - `VOTEKICK_DURATION_MINUTES` - длительность голосования `/votekick`.
-- `NONSENSE_*` - настройки случайных марковских реакций по истории чата.
-- `MEME_RENDER_CHANCE` - шанс отправить случайную фразу как мем на сохраненном фото.
 - `SLANG_REFRESH_HOURS` - период обновления словаря сленга чата.
 - `BACKUP_CHAT_ID` и `BACKUP_TIME` - чат и время для автобэкапа базы.
 - `SCRIPTURE_MORNING_TIME` - время утреннего слова (пусто - выключено), `SCRIPTURE_MORNING_DAYS` - дни через запятую из `sun,mon,tue,wed,thu,fri,sat`.
-- `SILENCE_VOTE_THRESHOLD` (5), `SILENCE_DURATION_DAYS` (7), `SILENCE_VOTE_HOURS` (24) - голосование `/тишина`: сколько голосов «за» нужно, на сколько дней бот перестаёт сам присылать цитаты (воскресное слово и мудрость дня в сводке) и сколько часов открыто голосование. Продлить можно за день до конца, бот об этом напоминает. `/мудрость` и `/стих` во время тишины отвечают как обычно.
+- `SILENCE_VOTE_THRESHOLD` (5), `SILENCE_DURATION_DAYS` (7), `SILENCE_VOTE_HOURS` (24) - голосование `/тишина`: сколько голосов «за» нужно, на сколько дней бот перестаёт сам писать в чат (вечерняя сводка и воскресное слово) и сколько часов открыто голосование. Продлить можно за день до конца, бот об этом напоминает. Команды во время тишины отвечают как обычно.
 - `REPENTANCE_ANNOUNCEMENT` - `0`, чтобы не отправлять разовое объявление «RAT покаялся». Оно уходит один раз, факт отправки хранится в таблице `bot_state`.
 
 `/stats` использует только SQLite и не обращается к Gemini, поэтому работает без расхода внешних API.
@@ -179,7 +171,6 @@ SQLite-база хранится на хосте:
 ```text
 ./data -> /app/data
 ./logs -> /app/logs
-./templates -> /app/templates
 ./.env -> /app/.env:ro
 ```
 
