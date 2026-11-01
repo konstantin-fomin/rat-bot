@@ -40,11 +40,11 @@ Always Free покрывает одну `e2-micro` в `us-central1`/`us-west1`/`
 services:
   bot:
     network_mode: host
-    build:
-      network: host
 ```
 
 Он нужен, потому что стандартная bridge-сеть Docker даёт контейнеру только IPv4, а у машины внешнего IPv4 нет. С `network_mode: host` контейнер использует сеть машины и ходит наружу по IPv6. Docker Compose подхватывает override-файл автоматически.
+
+Сборка образа (`docker compose up -d --build`) идёт в обычной сети Docker и требует временно включённого IPv4 — как и `git pull`. Не добавляйте в override `build: network: host`: новые версии Docker Compose без флага `--allow=network.host` такую сборку отклоняют.
 
 ### Как зайти на машину
 
