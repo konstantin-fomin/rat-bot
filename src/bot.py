@@ -72,6 +72,7 @@ MEME_TEMPLATE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 BOT_COMMANDS = [
     ("wisdom", "Мудрость из Притч и Екклесиаста"),
     ("verse", "Стих из Библии"),
+    ("silence", "Голосование: неделя без цитат из Библии"),
     ("roast", "Подколоть по-доброму по сообщениям в чате"),
     ("votekick", "Слово чату: терпим или нет"),
     ("stats", "Статистика чата: активность, топ участников"),
@@ -380,6 +381,9 @@ BOOT_TRIGGER_PATTERN = re.compile(r"^/?бут(?:@\w+)?$", re.IGNORECASE)
 # Telegram не считает кириллицу командой, поэтому /мудрость и /стих ловим как обычный текст.
 WISDOM_TRIGGER_PATTERN = re.compile(r"^/мудрость(?:@\w+)?$", re.IGNORECASE)
 VERSE_TRIGGER_PATTERN = re.compile(r"^/стих(?:@\w+)?$", re.IGNORECASE)
+SILENCE_TRIGGER_PATTERN = re.compile(r"^/тишина(?:@\w+)?$", re.IGNORECASE)
+SCRIPTURE_SILENCE_UNTIL_KEY = "scripture_silence_until"
+SILENCE_REMINDER_JOB_NAME = "scripture_silence_reminder"
 DIGEST_WISDOM_OPTIONS = 12
 WEEKDAY_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
 REPENTANCE_ANNOUNCEMENT_KEY = "repentance_announcement_v1"
@@ -392,6 +396,8 @@ REPENTANCE_ANNOUNCEMENT_TEXT = (
     "А ещё я теперь знаю пару цитат получше своих. Напишите /мудрость, и я достану что-нибудь "
     "из Притч Соломона или Екклесиаста (Соломон, оказывается, шутил тоньше меня 😅). "
     "А /стих пришлёт строчку из Библии.\n"
+    "\n"
+    "Если надоест — напишите /тишина. Наберётся 5 голосов, и я неделю не буду сам присылать цитаты.\n"
     "\n"
     "Ваш RAT"
 )
@@ -782,6 +788,18 @@ def get_scripture_morning_days() -> tuple[int, ...]:
     return tuple(sorted(set(days)))
 
 
+def get_silence_vote_threshold() -> int:
+    return get_positive_int_env("SILENCE_VOTE_THRESHOLD", 5)
+
+
+def get_silence_duration() -> timedelta:
+    return timedelta(days=get_positive_int_env("SILENCE_DURATION_DAYS", 7))
+
+
+def get_silence_vote_window() -> timedelta:
+    return timedelta(hours=get_positive_int_env("SILENCE_VOTE_HOURS", 24))
+
+
 def is_repentance_announcement_enabled() -> bool:
     return os.getenv("REPENTANCE_ANNOUNCEMENT", "1").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -1027,6 +1045,27 @@ def set_bot_state(key: str, value: str) -> None:
             (key, value),
         )
         connection.commit()
+
+
+def get_scripture_silence_until() -> datetime | None:
+    raw = get_bot_state(SCRIPTURE_SILENCE_UNTIL_KEY)
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError:
+        logger.warning("bad %s value in bot_state: %r", SCRIPTURE_SILENCE_UNTIL_KEY, raw)
+        return None
+
+
+def is_scripture_silenced(now: datetime | None = None) -> bool:
+    """Тишина: бот сам не присылает цитаты (воскресное слово, мудрость дня в сводке)."""
+    until = get_scripture_silence_until()
+    return until is not None and (now or datetime.now(timezone.utc)) < until
+
+
+def format_local_datetime(value: datetime) -> str:
+    return value.astimezone(get_app_timezone()).strftime("%d.%m в %H:%M")
 
 
 def get_day_bounds_utc(day: date, tz: ZoneInfo) -> tuple[str, str]:
@@ -1439,10 +1478,15 @@ def build_messages_transcript(messages: list[sqlite3.Row], name_map: dict[str, s
 def build_digest_request(
     messages: list[sqlite3.Row], name_map: dict[str, str], character_intro: str
 ) -> str:
-    wisdom_options = "\n".join(
-        f"- {entry['id']}: {' '.join(entry['text'].split())}"
-        for entry in scripture.sample_entries(scripture.WISDOM, DIGEST_WISDOM_OPTIONS)
-    )
+    if is_scripture_silenced():
+        wisdom_options = (
+            "(сегодня мудрость дня не нужна: верни \"wisdom_id\" и \"wisdom_comment\" пустыми строками)"
+        )
+    else:
+        wisdom_options = "\n".join(
+            f"- {entry['id']}: {' '.join(entry['text'].split())}"
+            for entry in scripture.sample_entries(scripture.WISDOM, DIGEST_WISDOM_OPTIONS)
+        )
     prompt = DIGEST_PROMPT_TEMPLATE.format(
         character_intro=character_intro,
         no_cliches_instruction=NO_CLICHES_INSTRUCTION,
@@ -2136,6 +2180,9 @@ def format_digest_html(data: dict) -> str:
         name = escape_html(str(nomination.get("name", "")).strip())
         reason = escape_html(str(nomination.get("reason", "")).strip())
         lines.append(f"<b>{title}</b> — {name} — {reason}")
+
+    if is_scripture_silenced():
+        return "\n".join(lines)
 
     wisdom_entry = resolve_digest_wisdom(data.get("wisdom_id"))
     lines.extend(["", scripture.format_entry_html(wisdom_entry, header="📜 <b>Мудрость дня</b>")])
@@ -3075,6 +3122,10 @@ async def send_scripture_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("утреннее слово пропущено: CHAT_ID не настроен")
         return
 
+    if is_scripture_silenced():
+        logger.info("утреннее слово пропущено: чат проголосовал за тишину")
+        return
+
     pool = random.choice((scripture.WISDOM, scripture.VERSE))
     entry = scripture.pick_entry(pool)
     await context.bot.send_message(
@@ -3501,6 +3552,185 @@ async def handle_votekick_callback(
         await finish_votekick(context, chat.id)
 
 
+def build_silence_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🤫 За тишину", callback_data="silence:yes"),
+                InlineKeyboardButton("🙂 Против", callback_data="silence:no"),
+            ]
+        ]
+    )
+
+
+def build_silence_vote_text(votes: dict[int, str], closes_at: datetime) -> str:
+    yes_count = sum(1 for choice in votes.values() if choice == "yes")
+    no_count = sum(1 for choice in votes.values() if choice == "no")
+    days = get_silence_duration().days
+    return (
+        f"🤫 Голосование: {days} дн. без цитат из Библии от бота?\n"
+        f"Бот не будет сам присылать воскресное слово и мудрость дня в сводке. "
+        f"/мудрость и /стих продолжат отвечать, если их попросить.\n\n"
+        f"За: {yes_count} из {get_silence_vote_threshold()} нужных | Против: {no_count}\n"
+        f"Голосование открыто до {format_local_datetime(closes_at)}"
+    )
+
+
+async def send_silence_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
+    allowed_chat_id = get_allowed_chat_id()
+    until = get_scripture_silence_until()
+    if allowed_chat_id is None or until is None or datetime.now(timezone.utc) >= until:
+        return
+
+    await context.bot.send_message(
+        chat_id=allowed_chat_id,
+        text=(
+            f"🤫 Тишина от цитат заканчивается {format_local_datetime(until)}. "
+            "Если хотите продлить ещё на неделю — /тишина."
+        ),
+    )
+    logger.info("silence reminder sent chat_id=%s until=%s", allowed_chat_id, until.isoformat())
+
+
+def schedule_silence_reminder(application: Application) -> None:
+    for job in application.job_queue.get_jobs_by_name(SILENCE_REMINDER_JOB_NAME):
+        job.schedule_removal()
+
+    until = get_scripture_silence_until()
+    if until is None:
+        return
+    remind_at = until - timedelta(days=1)
+    if remind_at <= datetime.now(timezone.utc):
+        return
+
+    application.job_queue.run_once(send_silence_reminder, when=remind_at, name=SILENCE_REMINDER_JOB_NAME)
+    logger.info("silence reminder scheduled at %s", remind_at.isoformat())
+
+
+async def handle_silence_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    if message is None or chat is None:
+        return
+    if not mark_update_processed_once(update, "/silence"):
+        return
+
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None or chat.id != allowed_chat_id:
+        logger.info("/silence ignored from chat_id=%s", chat.id)
+        return
+
+    sessions: dict[int, dict] = context.application.bot_data.setdefault("silence_sessions", {})
+    if sessions.get(chat.id) is not None:
+        await message.reply_text("Голосование за тишину уже идёт — кнопки выше 👆")
+        return
+
+    now = datetime.now(timezone.utc)
+    until = get_scripture_silence_until()
+    if until is not None and until - now > timedelta(days=1):
+        await message.reply_text(
+            f"Тишина уже действует до {format_local_datetime(until)}. "
+            "Продлить можно будет за день до конца."
+        )
+        return
+
+    closes_at = now + get_silence_vote_window()
+    votes: dict[int, str] = {}
+    sent = await message.reply_text(
+        build_silence_vote_text(votes, closes_at),
+        reply_markup=build_silence_keyboard(),
+    )
+    session = {"message_id": sent.message_id, "votes": votes, "closes_at": closes_at, "active": True}
+    session["job"] = context.application.job_queue.run_once(
+        close_silence_vote,
+        when=closes_at,
+        chat_id=chat.id,
+        name=f"silence_vote_{chat.id}",
+    )
+    sessions[chat.id] = session
+    logger.info("/silence vote started chat_id=%s closes_at=%s", chat.id, closes_at.isoformat())
+
+
+async def finish_silence_vote(context: ContextTypes.DEFAULT_TYPE, chat_id: int, passed: bool) -> None:
+    sessions: dict[int, dict] = context.application.bot_data.get("silence_sessions", {})
+    session = sessions.pop(chat_id, None)
+    if session is None or not session.get("active"):
+        return
+    session["active"] = False
+
+    yes_count = sum(1 for choice in session["votes"].values() if choice == "yes")
+    if passed:
+        now = datetime.now(timezone.utc)
+        current_until = get_scripture_silence_until()
+        start = current_until if current_until is not None and current_until > now else now
+        until = start + get_silence_duration()
+        set_bot_state(SCRIPTURE_SILENCE_UNTIL_KEY, until.isoformat())
+        schedule_silence_reminder(context.application)
+        text = (
+            f"🤫 Решено ({yes_count} голосов): до {format_local_datetime(until)} я сам цитаты не присылаю. "
+            "Понял, не навязываюсь 🙂"
+        )
+    else:
+        text = f"Голосование закрыто: за тишину {yes_count} из {get_silence_vote_threshold()}. Всё остаётся как было."
+
+    try:
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=session["message_id"], text=text)
+    except Exception:
+        logger.exception("/silence failed to edit vote message chat_id=%s", chat_id)
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    logger.info("/silence vote finished chat_id=%s passed=%s yes=%s", chat_id, passed, yes_count)
+
+
+async def close_silence_vote(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.job is not None and context.job.chat_id is not None:
+        await finish_silence_vote(context, context.job.chat_id, passed=False)
+
+
+async def handle_silence_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    chat = update.effective_chat
+    if query is None or chat is None:
+        return
+
+    sessions: dict[int, dict] = context.application.bot_data.get("silence_sessions", {})
+    session = sessions.get(chat.id)
+    if (
+        session is None
+        or not session.get("active")
+        or query.message is None
+        or query.message.message_id != session.get("message_id")
+    ):
+        await query.answer("Голосование уже завершено")
+        return
+
+    voter = query.from_user
+    _, _, choice = (query.data or "").partition(":")
+    if voter is None or choice not in ("yes", "no"):
+        await query.answer()
+        return
+
+    session["votes"][voter.id] = choice
+    yes_count = sum(1 for v in session["votes"].values() if v == "yes")
+    logger.info("/silence vote chat_id=%s voter_id=%s choice=%s yes=%s", chat.id, voter.id, choice, yes_count)
+
+    if yes_count >= get_silence_vote_threshold():
+        await query.answer("Голос принят")
+        job = session.get("job")
+        if job is not None:
+            job.schedule_removal()
+        await finish_silence_vote(context, chat.id, passed=True)
+        return
+
+    try:
+        await query.edit_message_text(
+            build_silence_vote_text(session["votes"], session["closes_at"]),
+            reply_markup=build_silence_keyboard(),
+        )
+    except Exception:
+        logger.exception("/silence failed to edit message chat_id=%s", chat.id)
+    await query.answer("Голос принят")
+
+
 async def handle_morning_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3848,6 +4078,7 @@ async def post_init(application: Application) -> None:
     )
     logger.info("bot commands registered: %s", [name for name, _ in BOT_COMMANDS])
     await send_repentance_announcement_once(application)
+    schedule_silence_reminder(application)
 
 
 def main() -> None:
@@ -3895,6 +4126,7 @@ def main() -> None:
     application.bot_data["name_map"] = load_name_map()
     application.add_handler(CommandHandler("wisdom", handle_wisdom_command))
     application.add_handler(CommandHandler("verse", handle_verse_command))
+    application.add_handler(CommandHandler("silence", handle_silence_command))
     application.add_handler(CommandHandler("roast", handle_roast_command))
     application.add_handler(CommandHandler("votekick", handle_votekick_command))
     application.add_handler(CommandHandler("weekly", handle_weekly_command))
@@ -3923,6 +4155,10 @@ def main() -> None:
     application.add_handler(
         MessageHandler(filters.TEXT & filters.Regex(VERSE_TRIGGER_PATTERN), handle_verse_command)
     )
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(SILENCE_TRIGGER_PATTERN), handle_silence_command)
+    )
+    application.add_handler(CallbackQueryHandler(handle_silence_callback, pattern=r"^silence:"))
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
