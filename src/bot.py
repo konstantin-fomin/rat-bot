@@ -39,7 +39,6 @@ LOG_PATH = Path(os.getenv("LOG_PATH", LOG_DIR / "bot.log"))
 NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 DEFAULT_GEMINI_MODEL = "gemini-3.6-flash"
-DEFAULT_GEMINI_FAST_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_GEMINI_DAILY_DIGEST_MODEL = "gemini-3.8-flash"
 DEFAULT_GEMINI_WEEKLY_DIGEST_MODEL = "gemini-3.8-flash"
 DEFAULT_GEMINI_ROAST_MODEL = "gemini-3.8-flash"
@@ -50,8 +49,6 @@ GEMINI_RETRY_BASE_DELAY_SECONDS = 1.5
 GEMINI_RETRY_MAX_DELAY_SECONDS = 20.0
 GEMINI_RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 GEMINI_TIMEOUT = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
-GEMINI_FAST_TIMEOUT = httpx.Timeout(connect=5.0, read=12.0, write=10.0, pool=5.0)
-GEMINI_RAT_MENTION_MAX_ATTEMPTS = 3
 GEMINI_ROAST_MAX_ATTEMPTS = 2
 GEMINI_ROAST_TIMEOUT = httpx.Timeout(connect=8.0, read=45.0, write=20.0, pool=5.0)
 DEFAULT_TELEGRAM_CONCURRENT_UPDATES = 8
@@ -363,7 +360,6 @@ DIGEST_PROMPT_TEMPLATE = """{character_intro}
 {no_cliches_instruction}
 """
 
-RAT_MENTION_PATTERN = re.compile(r"\bкрыс[а-яё]*\b", re.IGNORECASE)
 BOOT_TRIGGER_PATTERN = re.compile(r"^/?бут(?:@\w+)?$", re.IGNORECASE)
 # Telegram не считает кириллицу командой, поэтому /мудрость и /стих ловим как обычный текст.
 WISDOM_TRIGGER_PATTERN = re.compile(r"^/мудрость(?:@\w+)?$", re.IGNORECASE)
@@ -399,40 +395,6 @@ REPENTANCE_ANNOUNCEMENT_TEXT = (
     "Ваш исправляющийся RAT"
 )
 
-RAT_REPLY_PROMPT_TEMPLATE = (
-    "{character_intro}\n"
-    "Кто-то в чате только что упомянул слово 'крыса' (в каком-то виде) в сообщении ниже:\n"
-    "{text}\n"
-    "Придумай короткий остроумный ответ на 1-2 предложения от лица RAT — крысы, которая недавно "
-    "покаялась и теперь старается быть доброй. Можно мягко подколоть ситуацию или себя самого, "
-    "но не унижать человека. Обыграй упоминание слова с иронией, а не по шаблону. "
-    "НЕ вставляй дословную цитату исходного сообщения в кавычках — обыграй его своими словами, "
-    "без цитирования. Ответ должен звучать как твоя собственная реплика, а не разбор чужой "
-    "фразы с вставками из неё. "
-    "НЕ повторяй и не цитируй в кавычках само слово/фразу, которую написал человек "
-    "(ни целиком сообщение, ни отдельное слово вроде 'крыса', 'бычок' и т.п.) — реагируй "
-    "по существу, без цитирования и без шаблонного открывающего приёма 'ах, [слово], значит?'. "
-    "Начни ответ с разных структур, а не всегда с разбора конкретного слова. "
-    "Обязательный ракурс ответа: {style_instruction}. "
-    "Архетип ответа: {archetype_instruction}. "
-    "Ответь только текстом реплики, без кавычек и пояснений."
-)
-RAT_REPLY_STYLE_INSTRUCTIONS = (
-    "самоирония бывшей злой крысы, которая честно исправляется",
-    "добродушный стендап про крысиную жизнь",
-    "псевдонаучная справка о крысах с неожиданно тёплым выводом",
-    "ответ так, будто RAT борется с искушением снова съязвить — и побеждает",
-    "тёплая бытовая метафора",
-    "лёгкое притворное возмущение: «я вообще-то исправился!»",
-)
-RAT_REPLY_ARCHETYPE_INSTRUCTIONS = (
-    "короткий встречный вопрос с улыбкой",
-    "абсурдный неожиданный поворот темы",
-    "дружеский подкол без укола",
-    "благодушная мудрость пожилого грызуна",
-    "мини-исповедь бывшего прожарщика",
-    "сухая ирония с тёплой концовкой",
-)
 ROAST_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Вот реальные сообщения человека по имени {name} за последнее время:\n"
@@ -1345,17 +1307,6 @@ def remember_generated_text(
     recent = recent_by_chat.setdefault(chat_id, [])
     recent.append(cleaned_text)
     recent_by_chat[chat_id] = recent[-RECENT_GENERATED_TEXTS_LIMIT:]
-
-
-def format_recent_rat_replies_instruction(recent_replies: list[str]) -> str:
-    if not recent_replies:
-        return ""
-
-    return (
-        "\n\nВот твои последние ответы на упоминание 'крысы' в этом чате: "
-        f"{' | '.join(recent_replies)}. "
-        "НЕ повторяй эти формулировки, образы и структуру фраз — придумай принципиально новый ракурс шутки."
-    )
 
 
 def format_recent_roasts_instruction(recent_roasts: list[str]) -> str:
@@ -2376,76 +2327,6 @@ def schedule_boot_followup(
     )
 
 
-async def maybe_reply_to_rat_mention(
-    message: Message,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> bool:
-    text = message.text
-    if not text or not RAT_MENTION_PATTERN.search(text):
-        return False
-
-    author = message.from_user
-    if author is not None and author.is_bot:
-        return False
-
-    chat_id = message.chat_id
-
-    character_intro = build_character_intro(context, chat_id)
-    recent_replies = get_recent_generated_texts(context, "recent_rat_replies", chat_id)
-    prompt = RAT_REPLY_PROMPT_TEMPLATE.format(
-        character_intro=character_intro,
-        text=text,
-        style_instruction=random.choice(RAT_REPLY_STYLE_INSTRUCTIONS),
-        archetype_instruction=random.choice(RAT_REPLY_ARCHETYPE_INSTRUCTIONS),
-    )
-    prompt += format_recent_rat_replies_instruction(recent_replies)
-    logger.info(
-        "rat mention detected chat_id=%s message_id=%s text=%r",
-        chat_id,
-        message.message_id,
-        text[:120],
-    )
-    fast_model = get_gemini_model("GEMINI_FAST_MODEL", DEFAULT_GEMINI_FAST_MODEL)
-    primary_model = get_gemini_model()
-    try:
-        try:
-            reply = await generate_gemini_text(
-                prompt,
-                max_attempts=GEMINI_RAT_MENTION_MAX_ATTEMPTS,
-                timeout=GEMINI_FAST_TIMEOUT,
-                model=fast_model,
-            )
-        except Exception as exc:
-            if primary_model == fast_model:
-                raise
-
-            logger.warning(
-                "rat mention reply: fast Gemini model failed, retrying with primary model "
-                "fast_model=%s primary_model=%s error=%r",
-                fast_model,
-                primary_model,
-                exc,
-            )
-            reply = await generate_gemini_text(
-                prompt,
-                max_attempts=1,
-                timeout=GEMINI_FAST_TIMEOUT,
-                model=primary_model,
-            )
-    except Exception:
-        logger.exception(
-            "rat mention reply: Gemini error fast_model=%s primary_model=%s",
-            fast_model,
-            primary_model,
-        )
-        return True
-
-    await message.reply_text(reply)
-    remember_generated_text(context, "recent_rat_replies", chat_id, reply)
-    logger.info("rat mention triggered text=%r reply=%r", text[:120], reply[:120])
-    return True
-
-
 async def get_or_build_markov_chain(
     context: ContextTypes.DEFAULT_TYPE,
     chat_id: int,
@@ -3019,7 +2900,6 @@ async def handle_text_reactions(
     chat_id: int,
 ) -> None:
     try:
-        # Реакция на слово «крыса» отключена.
         await maybe_send_nonsense_reaction(message, context, chat_id)
     except Exception:
         logger.exception(
