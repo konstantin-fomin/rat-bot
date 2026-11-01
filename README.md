@@ -61,7 +61,6 @@ cp .env.example .env
 TELEGRAM_BOT_TOKEN=
 GEMINI_API_KEY=
 GEMINI_MODEL=gemini-3.6-flash
-GEMINI_FAST_MODEL=gemini-3.5-flash-lite
 GEMINI_DAILY_DIGEST_MODEL=gemini-3.8-flash
 GEMINI_WEEKLY_DIGEST_MODEL=gemini-3.8-flash
 GEMINI_ROAST_MODEL=gemini-3.8-flash
@@ -96,7 +95,6 @@ REPENTANCE_ANNOUNCEMENT=1
 - `TELEGRAM_BOT_TOKEN` - токен Telegram-бота от BotFather.
 - `GEMINI_API_KEY` - ключ Gemini для генеративных команд и реакций.
 - `GEMINI_MODEL` - основная модель Gemini для генеративных команд.
-- `GEMINI_FAST_MODEL` - быстрая модель Gemini для коротких реакций.
 - `GEMINI_DAILY_DIGEST_MODEL` - первая модель для ежедневной сводки (отправляется автоматически в `DIGEST_TIME`); после неё бот пробует резервные модели.
 - `GEMINI_WEEKLY_DIGEST_MODEL` - первая модель для недельного дайджеста (`/weekly`); после неё бот пробует резервные модели.
 - `GEMINI_ROAST_MODEL` - первая модель для команды `/roast`; после неё бот пробует резервные модели.
