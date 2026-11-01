@@ -75,7 +75,6 @@ BOT_COMMANDS = [
     ("digest", "Собрать сводку дня (спойлер: будет больно)"),
     ("roast", "Диагноз по сообщениям в чате"),
     ("votekick", "Слово чату: терпим или нет"),
-    ("horoscope", "Гороскоп чата на завтра"),
     ("stats", "Статистика чата: активность, топ участников"),
     ("morning", "Прислать утреннее приветствие"),
     ("boot", "Бутнем?"),
@@ -483,18 +482,6 @@ MEME_CAPTION_PROMPT_TEMPLATE = (
     "Если нижняя строка не нужна, верни её пустой строкой.\n"
     "Верни ТОЛЬКО строгий валидный JSON без markdown, без пояснений, строго такого вида:\n"
     '{{"top_text": "верхняя строка", "bottom_text": "нижняя строка"}}'
-)
-
-HOROSCOPE_PROMPT_TEMPLATE = (
-    "{character_intro}\n"
-    "Сегодня в чате обсуждали (кратко): {topics}.\n"
-    "Придумай шуточный гороскоп на завтра для каждого из следующих людей: {names}.\n"
-    "Каждый прогноз — 1 короткое ироничное предложение, в шуточно-астрологическом стиле "
-    "(звёзды, планеты, знаки), можно отсылаться к характеру человека по его недавним репликам "
-    "в чате, если это уместно. Можно язвить и использовать нематерные оскорбительные формулировки.\n"
-    "Верни СТРОГО валидный JSON без markdown, формат:\n"
-    '{{"horoscopes": [{{"name": "Имя", "forecast": "текст прогноза"}}]}}\n\n'
-    + NO_CLICHES_INSTRUCTION
 )
 
 WEEKLY_DIGEST_PROMPT_TEMPLATE = (
@@ -1393,21 +1380,6 @@ def build_digest_request(
     return f"{prompt}\n\nСообщения за день:\n" + build_messages_transcript(messages, name_map)
 
 
-def build_horoscope_request(
-    messages: list[sqlite3.Row],
-    name_map: dict[str, str],
-    names: list[str],
-    character_intro: str,
-) -> str:
-    transcript = build_messages_transcript(messages, name_map)
-    topics = transcript if transcript else "ничего особенного"
-    return HOROSCOPE_PROMPT_TEMPLATE.format(
-        character_intro=character_intro,
-        topics=topics,
-        names=", ".join(names),
-    )
-
-
 def save_daily_digest(chat_id: int, date_str: str, digest_data: dict) -> None:
     with closing(connect_db()) as connection:
         connection.execute(
@@ -2093,18 +2065,6 @@ def format_digest_html(data: dict) -> str:
         name = escape_html(str(nomination.get("name", "")).strip())
         reason = escape_html(str(nomination.get("reason", "")).strip())
         lines.append(f"<b>{title}</b> — {name} — {reason}")
-
-    return "\n".join(lines)
-
-
-def format_horoscope_html(data: dict) -> str:
-    horoscopes = data.get("horoscopes") or []
-
-    lines = ["🔮 <b>Гороскоп чата на завтра</b>", ""]
-    for item in horoscopes:
-        name = escape_html(str(item.get("name", "")).strip())
-        forecast = escape_html(str(item.get("forecast", "")).strip())
-        lines.append(f"<b>{name}</b> — <i>{forecast}</i>")
 
     return "\n".join(lines)
 
@@ -3685,54 +3645,6 @@ async def finish_votekick(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> N
     )
 
 
-async def handle_horoscope_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None:
-        return
-    if not mark_update_processed_once(update, "/horoscope"):
-        return
-
-    allowed_chat_id = get_allowed_chat_id()
-    if allowed_chat_id is None:
-        logger.warning("/horoscope ignored because CHAT_ID is empty")
-        await message.reply_text("CHAT_ID не настроен, гороскоп собрать не получится")
-        return
-
-    if chat.id != allowed_chat_id:
-        logger.info("/horoscope ignored from chat_id=%s", chat.id)
-        return
-
-    name_map = context.application.bot_data.get("name_map", {})
-    names = list(name_map.values())
-    if not names:
-        logger.warning("/horoscope: словарик имён пуст, гороскоп составлять не для кого")
-        await message.reply_text("В словарике имён пока никого нет, гороскоп составлять не для кого")
-        return
-
-    tz = get_app_timezone()
-    rows = fetch_today_messages(allowed_chat_id, tz)
-    character_intro = build_character_intro(context, allowed_chat_id)
-    prompt = build_horoscope_request(rows, name_map, names, character_intro)
-
-    try:
-        raw_horoscope = await generate_gemini_text_with_fallback(prompt)
-        horoscope_data = parse_digest_json(raw_horoscope)
-    except Exception:
-        logger.exception("/horoscope failed to generate")
-        await message.reply_text("Звёзды сегодня не отвечают, попробуйте позже")
-        return
-
-    logger.info(
-        "/horoscope generated successfully people_count=%s",
-        len(horoscope_data.get("horoscopes") or []),
-    )
-    await message.reply_text(format_horoscope_html(horoscope_data), parse_mode="HTML")
-
-
 async def handle_weekly_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3956,7 +3868,6 @@ def main() -> None:
     application.add_handler(CommandHandler("digest", handle_digest_command))
     application.add_handler(CommandHandler("roast", handle_roast_command))
     application.add_handler(CommandHandler("votekick", handle_votekick_command))
-    application.add_handler(CommandHandler("horoscope", handle_horoscope_command))
     application.add_handler(CommandHandler("weekly", handle_weekly_command))
     application.add_handler(CommandHandler("stats", handle_stats_command))
     application.add_handler(CommandHandler("backup", handle_backup_command))
