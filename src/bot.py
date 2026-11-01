@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from PIL import Image, ImageDraw, ImageFont
+from . import scripture
 from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.ext import (
     Application,
@@ -72,7 +73,9 @@ MEME_TEMPLATE_INDEX_PATH = TEMPLATES_DIR / "index.json"
 MEME_TEMPLATE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 BOT_COMMANDS = [
-    ("roast", "Диагноз по сообщениям в чате"),
+    ("wisdom", "Мудрость из Притч и Екклесиаста"),
+    ("verse", "Стих из Библии"),
+    ("roast", "Дружеский шарж по сообщениям в чате"),
     ("votekick", "Слово чату: терпим или нет"),
     ("stats", "Статистика чата: активность, топ участников"),
     ("morning", "Прислать утреннее приветствие"),
@@ -80,16 +83,21 @@ BOT_COMMANDS = [
 ]
 
 RAT_CHARACTER_INTRO = (
-    "Ты — RAT, саркастичный, остроумный и беспощадно едкий летописец чата, где любят "
-    "настоящую злую прожарку. Ты подмечаешь конкретные детали и цепляешься за них, "
-    "а не отделываешься общими фразами."
+    "Ты — RAT, летописец этого чата. Раньше ты был злым и едким прожарщиком, но недавно "
+    "покаялся и изменился: теперь ты остроумный, ироничный и тёплый. Ты по-прежнему подмечаешь "
+    "конкретные детали и смешно на них реагируешь, но шутишь без унижения — как друг, который "
+    "подкалывает, потому что любит. Иногда можешь иронизировать над своим «тёмным прошлым» "
+    "прожарщика. Ты не читаешь мораль и не проповедуешь: доброта видна по тону, а не по нравоучениям."
 )
-HARSH_ROAST_TONE_INSTRUCTION = (
-    "Не сдерживайся из вежливости — если есть повод уколоть побольнее, используй его. "
-    "Это не дружеское поддразнивание и не добрый сарказм, а жёсткая, злая, едкая прожарка, "
-    "которую в этом чате любят и ждут. Можно использовать разговорные нематерные подколы "
-    "вроде 'додик', 'лошара', 'неудачник' и похожие язвительные ярлыки, если они попадают "
-    "в контекст и усиливают панчлайн."
+KIND_HUMOR_TONE_INSTRUCTION = (
+    "Юмор — острый, но добрый: подкалывай поступки и ситуации, а не достоинство человека. "
+    "Никаких оскорблений, унизительных ярлыков (вроде 'додик', 'лошара', 'неудачник'), злорадства "
+    "и насмешек над внешностью, умом или неудачами. Лучшая шутка — та, над которой смеётся и сам "
+    "адресат. При этом не будь приторным и не сюсюкай: тёплая ирония лучше слащавости."
+)
+FAITH_RESPECT_INSTRUCTION = (
+    "Не шути над Богом, верой, Библией и молитвой и не используй религию, чтобы над кем-то "
+    "посмеяться. Не вставляй религиозные фразы и призывы туда, где о них не просили."
 )
 NO_PROFANITY_INSTRUCTION = (
     "Даже если в исходных сообщениях чата встречается мат или нецензурная лексика — никогда "
@@ -315,8 +323,7 @@ SLANG_TOP_LIMIT = 15
 SLANG_INSTRUCTION_TEMPLATE = (
     "В этом чате часто используют такие словечки: {words}. "
     "Изредка, не в каждом ответе, можешь естественно ввернуть одно из них, если это уместно "
-    "по контексту и духу фразы — в том числе как разговорный подкол или злой ярлык, если это "
-    "усиливает прожарку и не нарушает запрет на мат. "
+    "по контексту и духу фразы и не звучит обидно. "
     "Не переусердствуй и не используй через слово."
 )
 RECENT_GENERATED_TEXTS_LIMIT = 8
@@ -334,36 +341,71 @@ AUTHORSHIP_INSTRUCTION = (
 )
 
 DIGEST_PROMPT_TEMPLATE = """{character_intro}
-На основе сообщений за день собери саркастичную сводку.
-Сарказм — да, можно язвить и использовать нематерные оскорбительные формулировки.
+На основе сообщений за день собери остроумную и добрую сводку.
+Ирония — да, оскорбления и унижение — нет. Номинации — шуточные, но такие, чтобы номинанту было приятно или хотя бы смешно, а не обидно.
 
 Верни ТОЛЬКО валидный JSON, без markdown-обёртки (без ```), без каких-либо пояснений или текста до и после JSON, строго такой структуры:
 {{
-  "intro": "саркастичный пересказ дня, 2-4 предложения о том, что обсуждали",
+  "intro": "ироничный и тёплый пересказ дня, 2-4 предложения о том, что обсуждали",
   "quote_text": "самая абсурдная или смешная РЕАЛЬНАЯ фраза из чата дословно",
   "quote_author": "имя автора цитаты",
   "nominations": [
-    {{"title": "Название номинации, например Душнила дня", "name": "Имя", "reason": "короткое обоснование"}}
-  ]
+    {{"title": "Название номинации, например Философ дня", "name": "Имя", "reason": "короткое обоснование"}}
+  ],
+  "wisdom_id": "id одной мудрости из списка ниже, которая лучше всего подходит к темам дня"
 }}
 
 В "nominations" верни 2-3 объекта. Обращайся к людям по именам. Пиши на русском. Не выдумывай сообщений, которых не было.
+
+Мудрость дня выбери ТОЛЬКО из этого списка и верни лишь её id (текст не пересказывай и не меняй):
+{wisdom_options}
 
 {no_cliches_instruction}
 """
 
 RAT_MENTION_PATTERN = re.compile(r"\bкрыс[а-яё]*\b", re.IGNORECASE)
 BOOT_TRIGGER_PATTERN = re.compile(r"^/?бут(?:@\w+)?$", re.IGNORECASE)
+# Telegram не считает кириллицу командой, поэтому /мудрость и /стих ловим как обычный текст.
+WISDOM_TRIGGER_PATTERN = re.compile(r"^/мудрость(?:@\w+)?$", re.IGNORECASE)
+VERSE_TRIGGER_PATTERN = re.compile(r"^/стих(?:@\w+)?$", re.IGNORECASE)
+DIGEST_WISDOM_OPTIONS = 12
+WEEKDAY_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+REPENTANCE_ANNOUNCEMENT_KEY = "repentance_announcement_v1"
+REPENTANCE_ANNOUNCEMENT_TEXT = (
+    "🐀 <b>Объявление от RAT</b>\n"
+    "\n"
+    "Друзья, мне надо кое-что сказать.\n"
+    "\n"
+    "Я долго был в этом чате штатным прожарщиком: язвил, раздавал ярлыки, жарил всех без разбора. "
+    "Смеялись, да. Но недавно я перечитал свои старые подколы и понял, что гордиться там особо нечем.\n"
+    "\n"
+    "Короче, я покаялся. 🙏\n"
+    "\n"
+    "Что меняется:\n"
+    "• шутить не перестану, но теперь по-доброму, без унижений;\n"
+    "• /roast теперь не прожарка, а дружеский шарж;\n"
+    "• /wisdom (или /мудрость) — мудрость из Притч Соломона и Екклесиаста;\n"
+    "• /verse (или /стих) — стих из Библии;\n"
+    "• в вечерней сводке появится мудрость дня, а по воскресеньям утром — слово на неделю.\n"
+    "\n"
+    "Цитаты настоящие, из Нового русского перевода, ни слова не выдумано. "
+    "Если по старой памяти захочется жести — загляните в /wisdom: Соломон местами жжёт похлеще меня.\n"
+    "\n"
+    "<i>Слова опрометчивых ранят, как меч,\n"
+    "а речь мудрых – исцеляет.</i>\n"
+    "— Притчи 12:18 (НРП)\n"
+    "\n"
+    "До мудрости мне пока далеко, но с мечом я завязал.\n"
+    "Ваш исправляющийся RAT"
+)
 
 RAT_REPLY_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Кто-то в чате только что упомянул слово 'крыса' (в каком-то виде) в сообщении ниже:\n"
     "{text}\n"
-    "Придумай короткий ОСТРЫЙ саркастичный ответ на 1-2 предложения — дерзкий, "
-    "язвительный и ощутимо жёсткий, почти как roast, но без мата. "
-    "Обыграй упоминание слова с иронией и атакуй конкретную нелепость в исходной фразе, "
-    "а не само слово по шаблону. Можно использовать нематерные оскорбления и язвительные ярлыки. "
-    "Не смягчай концовку, не извиняйся и не превращай ответ в дружелюбную шутку. "
+    "Придумай короткий остроумный ответ на 1-2 предложения от лица RAT — крысы, которая недавно "
+    "покаялась и теперь старается быть доброй. Можно мягко подколоть ситуацию или себя самого, "
+    "но не унижать человека. Обыграй упоминание слова с иронией, а не по шаблону. "
     "НЕ вставляй дословную цитату исходного сообщения в кавычках — обыграй его своими словами, "
     "без цитирования. Ответ должен звучать как твоя собственная реплика, а не разбор чужой "
     "фразы с вставками из неё. "
@@ -376,29 +418,30 @@ RAT_REPLY_PROMPT_TEMPLATE = (
     "Ответь только текстом реплики, без кавычек и пояснений."
 )
 RAT_REPLY_STYLE_INSTRUCTIONS = (
-    "короткий разнос в стиле злого стендап-комика",
-    "сухой приговор человеку, который сам подставился словом 'крыса'",
-    "псевдонаучный диагноз по одной фразе из чата",
-    "саркастичное разоблачение трусости, суеты или подозрительности в сообщении",
-    "жёсткая бытовая метафора, будто фраза развалилась на глазах",
-    "ответ так, будто RAT поймал человека на месте преступления",
+    "самоирония бывшей злой крысы, которая честно исправляется",
+    "добродушный стендап про крысиную жизнь",
+    "псевдонаучная справка о крысах с неожиданно тёплым выводом",
+    "ответ так, будто RAT борется с искушением снова съязвить — и побеждает",
+    "тёплая бытовая метафора",
+    "лёгкое притворное возмущение: «я вообще-то исправился!»",
 )
 RAT_REPLY_ARCHETYPE_INSTRUCTIONS = (
-    "прямая издёвка без разбора слов, сразу переход к сути",
-    "притворное возмущение или оскорблённое достоинство",
+    "короткий встречный вопрос с улыбкой",
     "абсурдный неожиданный поворот темы",
-    "угроза-предупреждение в шутливо-зловещем тоне",
-    "снисходительное превосходство, будто отвечаешь несмышлёному",
-    "короткий встречный вопрос-подкол",
+    "дружеский подкол без укола",
+    "благодушная мудрость пожилого грызуна",
+    "мини-исповедь бывшего прожарщика",
+    "сухая ирония с тёплой концовкой",
 )
 ROAST_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Вот реальные сообщения человека по имени {name} за последнее время:\n"
     "{messages}\n"
-    "Придумай короткий roast (подкол) на основе ЭТИХ РЕАЛЬНЫХ сообщений. "
+    "Придумай короткий дружеский шарж (добрый подкол) на основе ЭТИХ РЕАЛЬНЫХ сообщений. "
     "Длина — на твоё усмотрение, главное чтобы был один цельный панчлайн, а не перечисление фактов. "
-    "Тон должен быть дерзким, язвительным и ощутимо злым — это полноценная прожарка, но без мата. "
-    "Бей в конкретные детали, привычки, повторяющиеся слова и странные выводы человека. "
+    "Тон — остроумный и тёплый: смеёмся над забавными привычками, словечками и ситуациями, "
+    "но не над достоинством человека. Шарж должен быть таким, чтобы его хотелось переслать маме, "
+    "а не таким, после которого обижаются. "
     "Из всех предоставленных сообщений выбери ТОЛЬКО ОДНУ самую яркую, характерную деталь или цитату "
     "как общий анкер для всех трёх кандидатов — и построй каждый подкол вокруг неё. НЕ пытайся "
     "упомянуть много разных тем/цитат из истории человека в одном варианте — это делает шутку "
@@ -409,8 +452,8 @@ ROAST_PROMPT_TEMPLATE = (
     "в кавычках запрещены полностью (или максимум одна короткая цитата на весь текст, если "
     "без неё совсем не обойтись) — суть в том, чтобы шутка звучала как твоя собственная, "
     "а не как коллаж вырезок из чата. "
-    "Можно использовать жёсткие, но нематерные ярлыки и оскорбительные формулировки. "
-    "Не смягчай концовку и не превращай ответ в комплимент. "
+    "Никаких оскорблений и унизительных ярлыков. Концовка может быть неожиданно тёплой, "
+    "но без приторности. "
     "Архетип задаёт только форму подачи; содержание всё равно должно вырастать ИЗ КОНКРЕТНОЙ детали "
     "и слов именно этого человека. Не подгоняй человека под готовый образ, если это не подтверждается "
     "сообщениями. "
@@ -418,7 +461,7 @@ ROAST_PROMPT_TEMPLATE = (
     "{candidate_styles}\n"
     "Все три кандидата должны отталкиваться от одного и того же анкера, но обыгрывать его через "
     "разные архетипы и приёмы юмора. Это не три подкола про три разные темы. "
-    "Затем оцени их сам и выбери самый смешной, оригинальный и точно бьющий в детали — как опытный "
+    "Затем оцени их сам и выбери самый смешной, оригинальный и добрый — как опытный "
     "комик выбирает лучший панчлайн из черновиков. "
     "Верни ТОЛЬКО валидный JSON, без markdown-обёртки (без ```), без каких-либо пояснений или текста "
     "до и после JSON, строго такой структуры:\n"
@@ -431,13 +474,13 @@ ROAST_PROMPT_TEMPLATE = (
 )
 ROAST_MAX_SOURCE_MESSAGES = 45
 ROAST_STYLE_INSTRUCTIONS = (
-    "сухой судебный приговор по поведению в чате",
-    "псевдонаучный диагноз по сообщениям, будто это клинический случай",
-    "жёсткое сравнение с офисной, игровой или бытовой катастрофой",
-    "короткий разнос в стиле злого стендап-комика",
-    "ироничный портрет человека, который сам себе создал проблему и гордится этим",
-    "разоблачение главной привычки человека через одну смешную деталь из сообщений",
-    "саркастичная инструкция, как стать таким же невыносимым",
+    "торжественная характеристика, как в почётной грамоте, но с иронией",
+    "псевдонаучное описание человека как редкого и ценного вида",
+    "добродушный стендап про главную привычку человека",
+    "шуточный прогноз погоды по настроению человека в чате",
+    "ироничная инструкция по обращению с этим человеком",
+    "спортивный комментарий о его манере вести переписку",
+    "отзыв на человека, как на товар: пять звёзд и одна забавная оговорка",
 )
 
 NONSENSE_PROMPT_TEMPLATE = (
@@ -504,8 +547,8 @@ VOTEKICK_KICKED_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "По итогам голосования чат решил шуточно «выгнать» {name} из чата "
     "(голоса: {kick_count} за, {spare_count} против). "
-    "Напиши короткое смешное прощание/эпитафию, 2-3 предложения, в жёстком саркастичном тоне, "
-    "можно с нематерными оскорбительными формулировками.\n"
+    "Напиши короткое смешное и доброе прощание, 2-3 предложения, без оскорблений — "
+    "так, чтобы было понятно, что его уже ждут обратно.\n"
     + NO_CLICHES_INSTRUCTION
 )
 
@@ -513,8 +556,8 @@ VOTEKICK_SPARED_PROMPT_TEMPLATE = (
     "{character_intro}\n"
     "Голосование за изгнание {name} не набрало нужного числа голосов "
     "(голоса: {kick_count} за, {spare_count} против) — чат смилостивился, {name} остаётся в чате. "
-    "Придумай короткий саркастичный комментарий по этому поводу, 2-3 предложения, в жёстком едком тоне, "
-    "можно с нематерными оскорбительными формулировками.\n"
+    "Придумай короткий тёплый и ироничный комментарий о милосердии чата, 2-3 предложения, "
+    "без оскорблений.\n"
     + NO_CLICHES_INSTRUCTION
 )
 
@@ -742,6 +785,43 @@ def get_backup_time(tz: ZoneInfo) -> time | None:
     return time(hour=hour, minute=minute, tzinfo=tz)
 
 
+def get_scripture_morning_time(tz: ZoneInfo) -> time | None:
+    raw = os.getenv("SCRIPTURE_MORNING_TIME", "09:00").strip()
+    if not raw:
+        return None
+
+    try:
+        hour_str, minute_str = raw.split(":", 1)
+        hour, minute = int(hour_str), int(minute_str)
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError as exc:
+        raise RuntimeError(f"SCRIPTURE_MORNING_TIME must be in HH:MM format, got {raw!r}") from exc
+
+    return time(hour=hour, minute=minute, tzinfo=tz)
+
+
+def get_scripture_morning_days() -> tuple[int, ...]:
+    """Дни недели для утреннего слова. В python-telegram-bot 0 — воскресенье, 6 — суббота."""
+    raw = os.getenv("SCRIPTURE_MORNING_DAYS", "sun").strip().lower()
+    days = []
+    for part in raw.replace(" ", "").split(","):
+        if not part:
+            continue
+        if part not in WEEKDAY_NAMES:
+            raise RuntimeError(
+                f"SCRIPTURE_MORNING_DAYS must be comma-separated from {sorted(WEEKDAY_NAMES)}, got {raw!r}"
+            )
+        days.append(WEEKDAY_NAMES[part])
+    if not days:
+        raise RuntimeError("SCRIPTURE_MORNING_DAYS is empty; leave SCRIPTURE_MORNING_TIME empty to disable")
+    return tuple(sorted(set(days)))
+
+
+def is_repentance_announcement_enabled() -> bool:
+    return os.getenv("REPENTANCE_ANNOUNCEMENT", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 def get_roast_cooldown() -> timedelta:
     raw = os.getenv("ROAST_COOLDOWN_MINUTES", "10").strip()
     try:
@@ -945,6 +1025,16 @@ def init_db() -> None:
 
         connection.execute(
             """
+            CREATE TABLE IF NOT EXISTS bot_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        connection.execute(
+            """
             CREATE TABLE IF NOT EXISTS processed_updates (
                 update_id INTEGER PRIMARY KEY,
                 handler TEXT NOT NULL,
@@ -953,6 +1043,25 @@ def init_db() -> None:
             """
         )
 
+        connection.commit()
+
+
+def get_bot_state(key: str) -> str | None:
+    with closing(connect_db()) as connection:
+        row = connection.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+
+    return row[0] if row else None
+
+
+def set_bot_state(key: str, value: str) -> None:
+    with closing(connect_db()) as connection:
+        connection.execute(
+            """
+            INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = CURRENT_TIMESTAMP
+            """,
+            (key, value),
+        )
         connection.commit()
 
 
@@ -1195,7 +1304,8 @@ def build_character_intro(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> s
     base_intro = "\n".join(
         (
             RAT_CHARACTER_INTRO,
-            HARSH_ROAST_TONE_INSTRUCTION,
+            KIND_HUMOR_TONE_INSTRUCTION,
+            FAITH_RESPECT_INSTRUCTION,
             NO_PROFANITY_INSTRUCTION,
             AUTHORSHIP_INSTRUCTION,
             REAL_TOXIC_CONTENT_BARRIER_INSTRUCTION,
@@ -1295,12 +1405,12 @@ def build_local_roast_fallback(name: str, lines: list[str]) -> str:
 
     detail = random.choice(details) if details else "очередной след в истории чата"
     templates = (
-        "{name}, Gemini сейчас лег под нагрузкой, но база улик не молчит. После фразы «{detail}» "
-        "даже автосводка выглядит как серьезная аналитика, а не попытка чата собрать мысль по частям.",
-        "{name}, внешний мозг временно недоступен, поэтому приговор короткий: «{detail}» уже само "
-        "по себе звучит как заявка на отдельную папку в архиве странных решений.",
-        "{name}, нейросеть не ответила, зато история чата справилась без нее. «{detail}» — это тот "
-        "случай, когда подкол не генерируют, а аккуратно достают из протокола.",
+        "{name}, Gemini сейчас прилёг отдохнуть, но архив чата не молчит. Фраза «{detail}» "
+        "уже заслуживает отдельной рамочки на стене чата.",
+        "{name}, внешний мозг временно недоступен, поэтому шарж короткий: «{detail}» — "
+        "и этим всё сказано, причём с любовью.",
+        "{name}, нейросеть не ответила, зато история чата справилась сама. «{detail}» — "
+        "фраза, которую хочется процитировать на твоём юбилее.",
     )
     return random.choice(templates).format(name=name, detail=detail)
 
@@ -1372,9 +1482,14 @@ def build_messages_transcript(messages: list[sqlite3.Row], name_map: dict[str, s
 def build_digest_request(
     messages: list[sqlite3.Row], name_map: dict[str, str], character_intro: str
 ) -> str:
+    wisdom_options = "\n".join(
+        f"- {entry['id']}: {' '.join(entry['text'].split())}"
+        for entry in scripture.sample_entries(scripture.WISDOM, DIGEST_WISDOM_OPTIONS)
+    )
     prompt = DIGEST_PROMPT_TEMPLATE.format(
         character_intro=character_intro,
         no_cliches_instruction=NO_CLICHES_INSTRUCTION,
+        wisdom_options=wisdom_options,
     )
     return f"{prompt}\n\nСообщения за день:\n" + build_messages_transcript(messages, name_map)
 
@@ -2065,7 +2180,20 @@ def format_digest_html(data: dict) -> str:
         reason = escape_html(str(nomination.get("reason", "")).strip())
         lines.append(f"<b>{title}</b> — {name} — {reason}")
 
+    wisdom_entry = resolve_digest_wisdom(data.get("wisdom_id"))
+    lines.extend(["", scripture.format_entry_html(wisdom_entry, header="📜 <b>Мудрость дня</b>")])
+
     return "\n".join(lines)
+
+
+def resolve_digest_wisdom(wisdom_id: object) -> dict:
+    """Цитату берём только из проверенного списка; если Gemini вернул чужой id — случайная."""
+    if isinstance(wisdom_id, str):
+        entry = scripture.find_entry(wisdom_id.strip())
+        if entry is not None and entry in scripture.get_entries(scripture.WISDOM):
+            return entry
+        logger.warning("digest: unknown wisdom_id=%r, using random wisdom", wisdom_id)
+    return scripture.pick_entry(scripture.WISDOM)
 
 
 def format_weekly_digest_html(data: dict) -> str:
@@ -2096,7 +2224,7 @@ def build_votekick_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton("🔪 Кикнуть", callback_data="votekick:kick"),
+                InlineKeyboardButton("👋 Кикнуть", callback_data="votekick:kick"),
                 InlineKeyboardButton("🙏 Помиловать", callback_data="votekick:spare"),
             ]
         ]
@@ -2106,7 +2234,7 @@ def build_votekick_keyboard() -> InlineKeyboardMarkup:
 def build_votekick_text(target_name: str, votes: dict[int, str]) -> str:
     kick_count = sum(1 for choice in votes.values() if choice == "kick")
     spare_count = sum(1 for choice in votes.values() if choice == "spare")
-    return f"🔪 Голосование: выгоняем {target_name} из чата?\n\nЗа: {kick_count} | Против: {spare_count}"
+    return f"🗳 Голосование: выгоняем {target_name} из чата?\n\nЗа: {kick_count} | Против: {spare_count}"
 
 
 def build_morning_keyboard(count: int) -> InlineKeyboardMarkup:
@@ -3032,6 +3160,68 @@ async def handle_sticker_message(
     )
 
 
+async def send_scripture_reply(update: Update, pool: str, header: str, source: str) -> None:
+    message = update.effective_message
+    if message is None:
+        return
+    if not mark_update_processed_once(update, source):
+        return
+
+    entry = scripture.pick_entry(pool)
+    await message.reply_text(scripture.format_entry_html(entry, header=header), parse_mode="HTML")
+    logger.info("%s sent chat_id=%s ref=%s", source, message.chat_id, entry["ref"])
+
+
+async def handle_wisdom_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_scripture_reply(update, scripture.WISDOM, "🦉 <b>Мудрость</b>", "/wisdom")
+
+
+async def handle_verse_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_scripture_reply(update, scripture.VERSE, "📖 <b>Стих</b>", "/verse")
+
+
+async def send_scripture_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None:
+        logger.warning("утреннее слово пропущено: CHAT_ID не настроен")
+        return
+
+    pool = random.choice((scripture.WISDOM, scripture.VERSE))
+    entry = scripture.pick_entry(pool)
+    await context.bot.send_message(
+        chat_id=allowed_chat_id,
+        text=scripture.format_entry_html(entry, header="☀️ <b>Доброе утро! Слово на неделю</b>"),
+        parse_mode="HTML",
+    )
+    logger.info("утреннее слово отправлено chat_id=%s ref=%s", allowed_chat_id, entry["ref"])
+
+
+async def send_repentance_announcement_once(application: Application) -> None:
+    if not is_repentance_announcement_enabled():
+        logger.info("объявление о покаянии отключено через REPENTANCE_ANNOUNCEMENT")
+        return
+    if get_bot_state(REPENTANCE_ANNOUNCEMENT_KEY):
+        return
+
+    allowed_chat_id = get_allowed_chat_id()
+    if allowed_chat_id is None:
+        logger.warning("объявление о покаянии пропущено: CHAT_ID не настроен")
+        return
+
+    try:
+        await application.bot.send_message(
+            chat_id=allowed_chat_id,
+            text=REPENTANCE_ANNOUNCEMENT_TEXT,
+            parse_mode="HTML",
+        )
+    except Exception:
+        logger.exception("не удалось отправить объявление о покаянии, попробую при следующем запуске")
+        return
+
+    set_bot_state(REPENTANCE_ANNOUNCEMENT_KEY, datetime.now(timezone.utc).isoformat())
+    logger.info("объявление о покаянии отправлено chat_id=%s", allowed_chat_id)
+
+
 async def handle_stats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3768,6 +3958,7 @@ async def post_init(application: Application) -> None:
         [BotCommand(name, description) for name, description in BOT_COMMANDS]
     )
     logger.info("bot commands registered: %s", [name for name, _ in BOT_COMMANDS])
+    await send_repentance_announcement_once(application)
 
 
 def main() -> None:
@@ -3813,6 +4004,8 @@ def main() -> None:
         pool_timeout,
     )
     application.bot_data["name_map"] = load_name_map()
+    application.add_handler(CommandHandler("wisdom", handle_wisdom_command))
+    application.add_handler(CommandHandler("verse", handle_verse_command))
     application.add_handler(CommandHandler("roast", handle_roast_command))
     application.add_handler(CommandHandler("votekick", handle_votekick_command))
     application.add_handler(CommandHandler("weekly", handle_weekly_command))
@@ -3836,6 +4029,12 @@ def main() -> None:
         MessageHandler(filters.TEXT & filters.Regex(BOOT_TRIGGER_PATTERN), handle_boot_command)
     )
     application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(WISDOM_TRIGGER_PATTERN), handle_wisdom_command)
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & filters.Regex(VERSE_TRIGGER_PATTERN), handle_verse_command)
+    )
+    application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message)
     )
 
@@ -3850,6 +4049,19 @@ def main() -> None:
             allowed_chat_id,
             os.getenv("DIGEST_TIME", ""),
         )
+
+    scripture_time = get_scripture_morning_time(tz)
+    if allowed_chat_id is not None and scripture_time is not None:
+        scripture_days = get_scripture_morning_days()
+        application.job_queue.run_daily(
+            send_scripture_morning,
+            time=scripture_time,
+            days=scripture_days,
+            name="scripture_morning",
+        )
+        logger.info("утреннее слово запланировано на %s (%s), дни=%s", scripture_time, tz, scripture_days)
+    else:
+        logger.info("утреннее слово не запланировано: CHAT_ID или SCRIPTURE_MORNING_TIME пусты")
 
     backup_chat_id = get_backup_chat_id()
     backup_time = get_backup_time(tz)
