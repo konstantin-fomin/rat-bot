@@ -75,6 +75,22 @@ services:
 
 Чтобы обновление было бесплатным, держите IPv4 включённым меньше часа в месяц. Обычно хватает 5–10 минут.
 
+## Предпросмотр перед деплоем
+
+`scripts/preview.py` показывает в терминале, как новая версия поведёт себя на реальной базе, и **ничего не отправляет в Telegram**: объявление, примеры `/мудрость` и `/стих`, утреннее слово, вечернюю сводку за день и, по желанию, дружеский подкол участника (сводка и подкол генерируются через Gemini).
+
+Работающий бот при этом не трогается: `git pull` меняет только файлы на диске, а контейнер продолжает работать на старом образе до `docker compose up -d --build`.
+
+```bash
+cd ~/rat-bot && git pull \
+  && docker compose exec bot python -c "import sqlite3; sqlite3.connect('/app/data/messages.sqlite3').backup(sqlite3.connect('/app/data/preview.sqlite3'))" \
+  && docker run --rm --network host --env-file .env -e DB_PATH=/app/data/preview.sqlite3 \
+       -v "$PWD/src:/app/src:ro" -v "$PWD/scripts:/app/scripts:ro" -v "$PWD/config:/app/config:ro" -v "$PWD/data:/app/data" \
+       rat-bot-bot python -m scripts.preview --roast USERNAME; rm -f data/preview.sqlite3*
+```
+
+Параметры: `--date ГГГГ-ММ-ДД` — день сводки (по умолчанию вчера), `--roast USERNAME` — подкол участника (можно повторить, можно не указывать). `git pull` нужен с временным IPv4, остальное работает и по IPv6.
+
 ## Полезные команды (SSH машины)
 
 ```bash
