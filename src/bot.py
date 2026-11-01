@@ -72,7 +72,6 @@ MEME_TEMPLATE_INDEX_PATH = TEMPLATES_DIR / "index.json"
 MEME_TEMPLATE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 BOT_COMMANDS = [
-    ("digest", "Собрать сводку дня (спойлер: будет больно)"),
     ("roast", "Диагноз по сообщениям в чате"),
     ("votekick", "Слово чату: терпим или нет"),
     ("stats", "Статистика чата: активность, топ участников"),
@@ -3033,57 +3032,6 @@ async def handle_sticker_message(
     )
 
 
-async def handle_digest_command(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-) -> None:
-    message = update.effective_message
-    chat = update.effective_chat
-    if message is None or chat is None:
-        return
-    if not mark_update_processed_once(update, "/digest"):
-        return
-
-    allowed_chat_id = get_allowed_chat_id()
-    if allowed_chat_id is None:
-        logger.warning("/digest ignored because CHAT_ID is empty")
-        await message.reply_text("CHAT_ID не настроен, сводку собрать не получится")
-        return
-
-    if chat.id != allowed_chat_id:
-        logger.info("/digest ignored from chat_id=%s", chat.id)
-        return
-
-    tz = get_app_timezone()
-    name_map = context.application.bot_data.get("name_map", {})
-    rows = fetch_today_messages(allowed_chat_id, tz)
-    logger.info("/digest called chat_id=%s messages_count=%s", allowed_chat_id, len(rows))
-
-    if not rows:
-        await message.reply_text("За сегодня сообщений нет. Даже сарказму не из чего вырасти.")
-        return
-
-    character_intro = build_character_intro(context, allowed_chat_id)
-    prompt = build_digest_request(rows, name_map, character_intro)
-
-    try:
-        raw_digest = await generate_gemini_text_for_task(
-            prompt,
-            model_env="GEMINI_DAILY_DIGEST_MODEL",
-            model_default=DEFAULT_GEMINI_DAILY_DIGEST_MODEL,
-        )
-        digest_data = parse_digest_json(raw_digest)
-    except Exception:
-        logger.exception("failed to generate digest with Gemini")
-        await message.reply_text("Не смог собрать сводку, попробуйте позже")
-        return
-
-    save_daily_digest(allowed_chat_id, datetime.now(tz).date().isoformat(), digest_data)
-
-    logger.info("/digest generated successfully chat_id=%s", allowed_chat_id)
-    await message.reply_text(format_digest_html(digest_data), parse_mode="HTML")
-
-
 async def handle_stats_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3865,7 +3813,6 @@ def main() -> None:
         pool_timeout,
     )
     application.bot_data["name_map"] = load_name_map()
-    application.add_handler(CommandHandler("digest", handle_digest_command))
     application.add_handler(CommandHandler("roast", handle_roast_command))
     application.add_handler(CommandHandler("votekick", handle_votekick_command))
     application.add_handler(CommandHandler("weekly", handle_weekly_command))
