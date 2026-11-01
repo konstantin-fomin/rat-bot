@@ -10,15 +10,12 @@ import tempfile
 from collections import Counter, defaultdict
 from contextlib import closing
 from datetime import date, datetime, time, timedelta, timezone
-from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
-from PIL import Image, ImageDraw, ImageFont
 from . import scripture
-from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
+from telegram import Bot, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -33,7 +30,6 @@ BASE_DIR = Path("/app")
 DATA_DIR = Path(os.getenv("DATA_DIR", BASE_DIR / "data"))
 LOG_DIR = Path(os.getenv("LOG_DIR", BASE_DIR / "logs"))
 CONFIG_DIR = Path(os.getenv("CONFIG_DIR", BASE_DIR / "config"))
-TEMPLATES_DIR = Path(os.getenv("TEMPLATES_DIR", BASE_DIR / "templates"))
 DB_PATH = Path(os.getenv("DB_PATH", DATA_DIR / "messages.sqlite3"))
 LOG_PATH = Path(os.getenv("LOG_PATH", LOG_DIR / "bot.log"))
 NAMES_PATH = Path(os.getenv("NAMES_PATH", CONFIG_DIR / "names.txt"))
@@ -56,23 +52,15 @@ DEFAULT_TELEGRAM_CONNECTION_POOL_SIZE = 32
 DEFAULT_TELEGRAM_POOL_TIMEOUT = 10.0
 DEFAULT_SQLITE_TIMEOUT_SECONDS = 30.0
 BOOT_FOLLOWUP_DELAY_SECONDS = 180
-IMGFLIP_MEMES_ENDPOINT = "https://api.imgflip.com/get_memes"
-MEME_FONT_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO = 0.20
-MEME_MIN_FONT_WIDTH_RATIO = 0.05
-MEME_SAFE_TEXT_PATTERN = re.compile(r"[^а-яА-ЯёЁa-zA-Z0-9\s.,!?—\-:;()]")
 LOCAL_ROAST_UNSAFE_WORD_PATTERN = re.compile(
     r"\b(?:бля\w*|хуй\w*|хуе\w*|пизд\w*|еба\w*|ёба\w*|уеб\w*|уёб\w*|заеб\w*)\b",
     re.IGNORECASE,
 )
-MEME_TEMPLATE_LIMIT = 20
-MEME_TEMPLATE_INDEX_PATH = TEMPLATES_DIR / "index.json"
-MEME_TEMPLATE_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp"}
 
 BOT_COMMANDS = [
     ("wisdom", "Мудрость из Притч и Екклесиаста"),
     ("verse", "Стих из Библии"),
-    ("silence", "Голосование: неделя без цитат из Библии"),
+    ("silence", "Голосование: неделя без сводок и рассылок бота"),
     ("roast", "Подколоть по-доброму по сообщениям в чате"),
     ("votekick", "Слово чату: терпим или нет"),
     ("stats", "Статистика чата: активность, топ участников"),
@@ -382,8 +370,8 @@ BOOT_TRIGGER_PATTERN = re.compile(r"^/?бут(?:@\w+)?$", re.IGNORECASE)
 WISDOM_TRIGGER_PATTERN = re.compile(r"^/мудрость(?:@\w+)?$", re.IGNORECASE)
 VERSE_TRIGGER_PATTERN = re.compile(r"^/стих(?:@\w+)?$", re.IGNORECASE)
 SILENCE_TRIGGER_PATTERN = re.compile(r"^/тишина(?:@\w+)?$", re.IGNORECASE)
-SCRIPTURE_SILENCE_UNTIL_KEY = "scripture_silence_until"
-SILENCE_REMINDER_JOB_NAME = "scripture_silence_reminder"
+SILENCE_UNTIL_KEY = "silence_until"
+SILENCE_REMINDER_JOB_NAME = "silence_reminder"
 DIGEST_WISDOM_OPTIONS = 12
 WEEKDAY_NAMES = {"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
 REPENTANCE_ANNOUNCEMENT_KEY = "repentance_announcement_v1"
@@ -397,7 +385,9 @@ REPENTANCE_ANNOUNCEMENT_TEXT = (
     "из Притч Соломона или Екклесиаста (Соломон, оказывается, шутил тоньше меня 😅). "
     "А /стих пришлёт строчку из Библии.\n"
     "\n"
-    "Если надоест — напишите /тишина. Наберётся 5 голосов, и я неделю не буду сам присылать цитаты.\n"
+    "И если я начну надоедать, есть новая команда /тишина. Она запускает голосование, и если "
+    "наберётся 5 голосов, я неделю не буду сам писать в чат: ни вечерних сводок, ни воскресного слова. "
+    "На команды при этом отвечаю как обычно. За день до конца напомню, и тишину можно продлить.\n"
     "\n"
     "Ваш RAT"
 )
@@ -453,48 +443,6 @@ ROAST_STYLE_INSTRUCTIONS = (
     "отзыв на человека, как на товар: пять звёзд и одна забавная оговорка",
 )
 
-NONSENSE_PROMPT_TEMPLATE = (
-    "{character_intro}\n"
-    "Вот случайная реальная фраза из истории этого чата: '{message}'. "
-    "Напиши ОДИН короткий, по-настоящему смешной комментарий-реакцию на эту фразу — "
-    "используй конкретный приём: гиперболу, неожиданный вывод, ироничное преувеличение "
-    "или абсурдное 'что, если...' развитие мысли. Оттолкнись ИМЕННО от этой фразы, "
-    "не добавляй посторонние несвязанные детали и темы — весь юмор должен строиться "
-    "вокруг одной этой мысли, а не мешанины из разного. Одно предложение, максимум два. "
-    "Без кавычек в ответе."
-)
-
-MEME_CAPTION_PROMPT_TEMPLATE = (
-    "{character_intro}\n"
-    "Вот несколько случайных реальных реплик из истории этого чата: {messages}.\n"
-    "Ты делаешь классический мем на шаблоне «{template_name}». "
-    "Механика шаблона: {template_description}.\n"
-    "Придумай подпись на русском, коротко и смешно, в тему выбранных реплик и в духе персонажа RAT. "
-    "Название мем-шаблона: '{template_name}'. Ты наверняка знаешь классическую структуру и механику "
-    "этого формата (например: сравнение/выбор между двумя вариантами, реакция-разоблачение, "
-    "нарастающий абсурд, и т.п.) — используй именно эту механику при распределении текста между "
-    "top_text и bottom_text, а не просто две произвольные фразы. Если не уверен в точной механике "
-    "конкретного шаблона — сделай раскладку в духе 'ожидание/сначала' сверху и "
-    "'неожиданный поворот/на самом деле' снизу.\n\n"
-    "ВАЖНО про сам панчлайн: он должен содержать настоящий неожиданный поворот, контраст или "
-    "разоблачение — а не просто описывать ситуацию или констатировать факт. Плохой пример механики "
-    "(не для копирования, просто для понимания разницы): констатация 'все будут переживать' — "
-    "это плоско. Хороший панчлайн вскрывает нелепость, доводит до абсурда, или переворачивает "
-    "ожидание. Представь, что рассказываешь это лучшему другу, чтобы он заржал в голос, "
-    "а не просто кивнул понимающе.\n"
-    "Избегай формата 'A = B, следствие C' как двух несвязанных ярлыков — вместо этого top_text "
-    "и bottom_text должны звучать как одна цельная мысль с сюжетным поворотом между ними, "
-    "а не как две отдельные подписи-этикетки. "
-    "top_text и bottom_text должны быть короткими фразами, максимум 5-6 слов каждая — "
-    "как в настоящих мемах, не пиши длинные предложения. "
-    "Желательно, чтобы каждая фраза умещалась в одну строку. "
-    "Используй только обычные русские и латинские буквы, цифры и стандартную пунктуацию "
-    "(точка, запятая, восклицательный/вопросительный знак, тире-минус). НЕ используй эмодзи "
-    "и специальные юникод-символы (например ➡️, 🤝, ✅ и подобные) — только простой текст. "
-    "Если нижняя строка не нужна, верни её пустой строкой.\n"
-    "Верни ТОЛЬКО строгий валидный JSON без markdown, без пояснений, строго такого вида:\n"
-    '{{"top_text": "верхняя строка", "bottom_text": "нижняя строка"}}'
-)
 
 WEEKLY_DIGEST_PROMPT_TEMPLATE = (
     "{character_intro}\n"
@@ -535,156 +483,6 @@ VOTEKICK_SPARED_PROMPT_TEMPLATE = (
 logger = logging.getLogger(__name__)
 _gemini_semaphore: asyncio.Semaphore | None = None
 _gemini_semaphore_limit: int | None = None
-
-
-def meme_template_description(template_name: str) -> str:
-    normalized = template_name.lower()
-    descriptions = {
-        "drake hotline bling": "отвергает первый вариант и одобряет второй",
-        "distracted boyfriend": "персонаж отвлекается от привычного выбора на более соблазнительный вариант",
-        "two buttons": "мучительный выбор между двумя неудобными вариантами",
-        "left exit": "резкий и нелепый уход с нормального пути к неожиданному решению",
-        "change my mind": "самоуверенное спорное утверждение, которое предлагается оспорить",
-        "expanding brain": "нарастающие уровни всё более странного или якобы гениального мышления",
-        "buff doge": "контраст сильной старой версии и слабой новой версии",
-        "woman yelling at cat": "эмоциональное обвинение против невозмутимой реакции",
-        "uno draw 25 cards": "человек выбирает наказание вместо простого действия",
-        "running away balloon": "кто-то теряет контроль над желаемой вещью или идеей",
-        "bernie i am once again asking": "настойчивая повторная просьба о чём-то",
-        "gru's plan": "план звучит нормально, пока внезапно не становится абсурдным",
-        "always has been": "внезапное признание, что странная правда была очевидна всегда",
-        "disaster girl": "невинное довольство на фоне хаоса",
-        "mocking spongebob": "насмешливое передразнивание чужой фразы",
-        "one does not simply": "нельзя просто так взять и сделать очевидную вещь",
-    }
-
-    for key, description in descriptions.items():
-        if key in normalized:
-            return description
-
-    return (
-        "обыграй верхнюю и нижнюю строку в контрасте; если шаблон подсказывает роли, "
-        "используй их естественно"
-    )
-
-
-def list_meme_template_files() -> list[Path]:
-    if not TEMPLATES_DIR.exists():
-        return []
-
-    return sorted(
-        path
-        for path in TEMPLATES_DIR.iterdir()
-        if path.is_file() and path.suffix.lower() in MEME_TEMPLATE_IMAGE_SUFFIXES
-    )
-
-
-def load_meme_template_index() -> dict[str, str]:
-    if not MEME_TEMPLATE_INDEX_PATH.exists():
-        return {}
-
-    try:
-        raw = json.loads(MEME_TEMPLATE_INDEX_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        logger.exception("failed to read meme template index: %s", MEME_TEMPLATE_INDEX_PATH)
-        return {}
-
-    if not isinstance(raw, dict):
-        logger.warning("meme template index has unexpected shape: %s", MEME_TEMPLATE_INDEX_PATH)
-        return {}
-
-    return {str(template_id): str(name) for template_id, name in raw.items()}
-
-
-def get_random_meme_template() -> tuple[Path, str] | None:
-    template_files = list_meme_template_files()
-    if not template_files:
-        return None
-
-    template_path = random.choice(template_files)
-    index = load_meme_template_index()
-    template_name = index.get(template_path.stem, template_path.stem)
-    return template_path, template_name
-
-
-def get_template_file_suffix(url: str) -> str:
-    suffix = Path(urlparse(url).path).suffix.lower()
-    if suffix in MEME_TEMPLATE_IMAGE_SUFFIXES:
-        return suffix
-    return ".jpg"
-
-
-def ensure_meme_templates() -> None:
-    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
-
-    existing_templates = list_meme_template_files()
-    if existing_templates:
-        logger.info(
-            "meme templates found locally: dir=%s count=%s; skipping download",
-            TEMPLATES_DIR,
-            len(existing_templates),
-        )
-        return
-
-    logger.info("meme templates not found; checking access to %s", IMGFLIP_MEMES_ENDPOINT)
-    try:
-        with httpx.Client(timeout=30, follow_redirects=True) as client:
-            response = client.get(IMGFLIP_MEMES_ENDPOINT)
-            response.raise_for_status()
-            data = response.json()
-            memes = data.get("data", {}).get("memes", [])
-            if not data.get("success") or not isinstance(memes, list):
-                logger.warning("Imgflip returned unexpected meme list response: %s", data)
-                return
-
-            downloaded: dict[str, str] = {}
-            for meme in memes[:MEME_TEMPLATE_LIMIT]:
-                template_id = str(meme.get("id", "")).strip()
-                template_name = str(meme.get("name", "")).strip()
-                template_url = str(meme.get("url", "")).strip()
-                if not template_id or not template_name or not template_url:
-                    continue
-
-                suffix = get_template_file_suffix(template_url)
-                template_path = TEMPLATES_DIR / f"{template_id}{suffix}"
-                try:
-                    image_response = client.get(template_url)
-                    image_response.raise_for_status()
-                    template_path.write_bytes(image_response.content)
-                except Exception:
-                    logger.exception(
-                        "failed to download meme template id=%s name=%r url=%s",
-                        template_id,
-                        template_name,
-                        template_url,
-                    )
-                    continue
-
-                downloaded[template_id] = template_name
-
-    except httpx.RequestError as exc:
-        logger.warning(
-            "Imgflip template download skipped: no network access to api.imgflip.com (%s)",
-            exc,
-        )
-        return
-    except Exception:
-        logger.exception("Imgflip template download failed")
-        return
-
-    if not downloaded:
-        logger.warning("Imgflip template download finished with zero downloaded templates")
-        return
-
-    MEME_TEMPLATE_INDEX_PATH.write_text(
-        json.dumps(downloaded, ensure_ascii=False, indent=2, sort_keys=True),
-        encoding="utf-8",
-    )
-    logger.info(
-        "downloaded meme templates from Imgflip: dir=%s count=%s",
-        TEMPLATES_DIR,
-        len(downloaded),
-    )
 
 
 def setup_logging() -> None:
@@ -847,50 +645,6 @@ def get_votekick_duration() -> timedelta:
     return timedelta(minutes=minutes)
 
 
-def get_nonsense_chain_refresh_interval() -> timedelta:
-    raw = os.getenv("NONSENSE_CHAIN_REFRESH_MINUTES", "60").strip()
-    try:
-        minutes = float(raw)
-    except ValueError:
-        minutes = 60.0
-
-    return timedelta(minutes=minutes)
-
-
-def get_nonsense_cooldown() -> timedelta:
-    raw = os.getenv("NONSENSE_COOLDOWN_MINUTES", "30").strip()
-    try:
-        minutes = float(raw)
-    except ValueError:
-        minutes = 30.0
-
-    return timedelta(minutes=minutes)
-
-
-def get_nonsense_reaction_chance() -> float:
-    raw = os.getenv("NONSENSE_REACTION_CHANCE", "0.03").strip()
-    try:
-        return float(raw)
-    except ValueError:
-        return 0.03
-
-
-def get_nonsense_min_messages() -> int:
-    raw = os.getenv("NONSENSE_MIN_MESSAGES", "300").strip()
-    try:
-        return int(raw)
-    except ValueError:
-        return 300
-
-
-def get_meme_render_chance() -> float:
-    raw = os.getenv("MEME_RENDER_CHANCE", "0.4").strip()
-    try:
-        return float(raw)
-    except ValueError:
-        return 0.4
-
-
 def get_slang_refresh_interval() -> timedelta:
     raw = os.getenv("SLANG_REFRESH_HOURS", "24").strip()
     try:
@@ -1047,20 +801,20 @@ def set_bot_state(key: str, value: str) -> None:
         connection.commit()
 
 
-def get_scripture_silence_until() -> datetime | None:
-    raw = get_bot_state(SCRIPTURE_SILENCE_UNTIL_KEY)
+def get_silence_until() -> datetime | None:
+    raw = get_bot_state(SILENCE_UNTIL_KEY)
     if not raw:
         return None
     try:
         return datetime.fromisoformat(raw)
     except ValueError:
-        logger.warning("bad %s value in bot_state: %r", SCRIPTURE_SILENCE_UNTIL_KEY, raw)
+        logger.warning("bad %s value in bot_state: %r", SILENCE_UNTIL_KEY, raw)
         return None
 
 
-def is_scripture_silenced(now: datetime | None = None) -> bool:
-    """Тишина: бот сам не присылает цитаты (воскресное слово, мудрость дня в сводке)."""
-    until = get_scripture_silence_until()
+def is_bot_silenced(now: datetime | None = None) -> bool:
+    """Тишина: бот сам ничего не пишет в чат (вечерняя сводка, воскресное слово). Команды работают."""
+    until = get_silence_until()
     return until is not None and (now or datetime.now(timezone.utc)) < until
 
 
@@ -1175,76 +929,6 @@ def fetch_user_messages(
     with closing(connect_db()) as connection:
         connection.row_factory = sqlite3.Row
         return connection.execute(query, params).fetchall()
-
-
-def count_chat_messages(chat_id: int) -> int:
-    with closing(connect_db()) as connection:
-        row = connection.execute(
-            "SELECT COUNT(*) FROM messages WHERE chat_id = ?",
-            (chat_id,),
-        ).fetchone()
-
-    return row[0] if row else 0
-
-
-def count_non_bot_chat_messages(chat_id: int) -> int:
-    with closing(connect_db()) as connection:
-        row = connection.execute(
-            """
-            SELECT COUNT(*)
-            FROM messages
-            WHERE chat_id = ?
-              AND (is_bot IS NULL OR is_bot = 0)
-              AND trim(text) != ''
-            """,
-            (chat_id,),
-        ).fetchone()
-
-    return row[0] if row else 0
-
-
-def fetch_all_chat_texts(chat_id: int) -> list[str]:
-    with closing(connect_db()) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            """
-            SELECT text
-            FROM messages
-            WHERE chat_id = ?
-              AND (is_bot IS NULL OR is_bot = 0)
-            ORDER BY message_datetime ASC, message_id ASC
-            """,
-            (chat_id,),
-        ).fetchall()
-
-    return [row["text"] for row in rows if row["text"] and row["text"].strip()]
-
-
-def fetch_random_messages_sample(chat_id: int, n: int = 1) -> list[str]:
-    if n <= 0:
-        return []
-
-    with closing(connect_db()) as connection:
-        connection.row_factory = sqlite3.Row
-        rows = connection.execute(
-            """
-            SELECT text
-            FROM messages
-            WHERE chat_id = ?
-              AND (is_bot IS NULL OR is_bot = 0)
-              AND trim(text) != ''
-              AND length(trim(text)) - length(replace(trim(text), ' ', '')) >= 3
-            ORDER BY RANDOM()
-            LIMIT ?
-            """,
-            (chat_id, n),
-        ).fetchall()
-
-    return [
-        row["text"].strip()
-        for row in rows
-        if row["text"] and len(row["text"].strip().split()) >= 4
-    ]
 
 
 def extract_chat_slang(chat_id: int) -> list[str]:
@@ -1411,17 +1095,6 @@ def build_local_roast_fallback(name: str, lines: list[str]) -> str:
     return random.choice(templates).format(name=name, detail=detail)
 
 
-def format_recent_nonsense_phrases_instruction(recent_phrases: list[str]) -> str:
-    if not recent_phrases:
-        return ""
-
-    return (
-        "\n\nВот твои последние такие фразы: "
-        f"{' | '.join(recent_phrases)}. "
-        "Не повторяй эти образы и структуру."
-    )
-
-
 def get_author_name(
     row: sqlite3.Row,
     name_map: dict[str, str],
@@ -1478,15 +1151,10 @@ def build_messages_transcript(messages: list[sqlite3.Row], name_map: dict[str, s
 def build_digest_request(
     messages: list[sqlite3.Row], name_map: dict[str, str], character_intro: str
 ) -> str:
-    if is_scripture_silenced():
-        wisdom_options = (
-            "(сегодня мудрость дня не нужна: верни \"wisdom_id\" и \"wisdom_comment\" пустыми строками)"
-        )
-    else:
-        wisdom_options = "\n".join(
-            f"- {entry['id']}: {' '.join(entry['text'].split())}"
-            for entry in scripture.sample_entries(scripture.WISDOM, DIGEST_WISDOM_OPTIONS)
-        )
+    wisdom_options = "\n".join(
+        f"- {entry['id']}: {' '.join(entry['text'].split())}"
+        for entry in scripture.sample_entries(scripture.WISDOM, DIGEST_WISDOM_OPTIONS)
+    )
     prompt = DIGEST_PROMPT_TEMPLATE.format(
         character_intro=character_intro,
         no_cliches_instruction=NO_CLICHES_INSTRUCTION,
@@ -1568,289 +1236,6 @@ def build_weekly_digest(chat_id: int, character_intro: str) -> str | None:
         character_intro=character_intro,
         days="\n\n".join(day_blocks),
     )
-
-
-def build_markov_chain(texts: list[str]) -> dict[tuple[str, str], list[str]]:
-    chain: dict[tuple[str, str], list[str]] = {}
-    for text in texts:
-        words = text.split()
-        if len(words) < 3:
-            continue
-        for i in range(len(words) - 2):
-            key = (words[i], words[i + 1])
-            chain.setdefault(key, []).append(words[i + 2])
-
-    return chain
-
-
-def generate_nonsense_phrase(chain: dict[tuple[str, str], list[str]]) -> str | None:
-    if not chain:
-        return None
-
-    words = list(random.choice(list(chain.keys())))
-    target_length = random.randint(5, 20)
-
-    while len(words) < target_length:
-        next_words = chain.get((words[-2], words[-1]))
-        if not next_words:
-            break
-        words.append(random.choice(next_words))
-
-    return " ".join(words)
-
-
-def normalize_meme_text(text: str) -> str:
-    safe_text = MEME_SAFE_TEXT_PATTERN.sub("", str(text or ""))
-    return " ".join(safe_text.split()).strip().upper()
-
-
-def split_word_to_fit(
-    draw: ImageDraw.ImageDraw,
-    word: str,
-    font: ImageFont.FreeTypeFont,
-    stroke_width: int,
-    max_width: int,
-) -> list[str]:
-    parts: list[str] = []
-    current = ""
-    for char in word:
-        candidate = current + char
-        bbox = draw.textbbox((0, 0), candidate, font=font, stroke_width=stroke_width)
-        if current and bbox[2] - bbox[0] > max_width:
-            parts.append(current)
-            current = char
-        else:
-            current = candidate
-
-    if current:
-        parts.append(current)
-
-    return parts or [word]
-
-
-def wrap_meme_lines(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font: ImageFont.FreeTypeFont,
-    stroke_width: int,
-    max_width: int,
-) -> list[str]:
-    words = text.split()
-    if not words:
-        return []
-
-    lines: list[str] = []
-    current = ""
-    for word in words:
-        candidate = f"{current} {word}".strip()
-        bbox = draw.textbbox((0, 0), candidate, font=font, stroke_width=stroke_width)
-        if not current or bbox[2] - bbox[0] <= max_width:
-            current = candidate
-            continue
-
-        lines.append(current)
-        word_bbox = draw.textbbox((0, 0), word, font=font, stroke_width=stroke_width)
-        if word_bbox[2] - word_bbox[0] <= max_width:
-            current = word
-        else:
-            split_parts = split_word_to_fit(draw, word, font, stroke_width, max_width)
-            lines.extend(split_parts[:-1])
-            current = split_parts[-1]
-
-    if current:
-        lines.append(current)
-
-    return lines
-
-
-def measure_meme_block(
-    draw: ImageDraw.ImageDraw,
-    lines: list[str],
-    font: ImageFont.FreeTypeFont,
-    stroke_width: int,
-    line_gap: int,
-) -> tuple[int, int]:
-    if not lines:
-        return 0, 0
-
-    widths = []
-    heights = []
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
-        widths.append(bbox[2] - bbox[0])
-        heights.append(bbox[3] - bbox[1])
-
-    return max(widths), sum(heights) + line_gap * (len(lines) - 1)
-
-
-def get_meme_font_settings(font_size: int) -> tuple[ImageFont.FreeTypeFont, int, int]:
-    font = ImageFont.truetype(MEME_FONT_PATH, font_size)
-    stroke_width = max(2, font_size // 14)
-    line_gap = max(3, font_size // 8)
-    return font, stroke_width, line_gap
-
-
-def truncate_meme_text_to_fit(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    font: ImageFont.FreeTypeFont,
-    stroke_width: int,
-    line_gap: int,
-    max_width: int,
-    max_height: int,
-) -> tuple[list[str], int]:
-    words = text.split()
-    if not words:
-        return [], 0
-
-    for word_count in range(len(words), 0, -1):
-        trimmed = " ".join(words[:word_count]).rstrip(" ,.!?;:…")
-        candidate = f"{trimmed}…" if trimmed else "…"
-        lines = wrap_meme_lines(draw, candidate, font, stroke_width, max_width)
-        _, block_height = measure_meme_block(draw, lines, font, stroke_width, line_gap)
-        if block_height <= max_height:
-            return lines, block_height
-
-    lines = wrap_meme_lines(draw, "…", font, stroke_width, max_width)
-    _, block_height = measure_meme_block(draw, lines, font, stroke_width, line_gap)
-    if block_height <= max_height:
-        return lines, block_height
-
-    return [], 0
-
-
-def fit_meme_block(
-    draw: ImageDraw.ImageDraw,
-    text: str,
-    max_font_size: int,
-    min_font_size: int,
-    max_width: int,
-    max_height: int,
-) -> tuple[ImageFont.FreeTypeFont, int, int, list[str], int]:
-    if not text:
-        font, stroke_width, line_gap = get_meme_font_settings(min_font_size)
-        return font, stroke_width, line_gap, [], 0
-
-    for font_size in range(max_font_size, min_font_size - 1, -2):
-        font, stroke_width, line_gap = get_meme_font_settings(font_size)
-        lines = wrap_meme_lines(draw, text, font, stroke_width, max_width)
-        _, block_height = measure_meme_block(draw, lines, font, stroke_width, line_gap)
-        if block_height <= max_height:
-            return font, stroke_width, line_gap, lines, block_height
-
-    font, stroke_width, line_gap = get_meme_font_settings(min_font_size)
-    lines = wrap_meme_lines(draw, text, font, stroke_width, max_width)
-    _, block_height = measure_meme_block(draw, lines, font, stroke_width, line_gap)
-    if block_height > max_height:
-        lines, block_height = truncate_meme_text_to_fit(
-            draw,
-            text,
-            font,
-            stroke_width,
-            line_gap,
-            max_width,
-            max_height,
-        )
-
-    return font, stroke_width, line_gap, lines, block_height
-
-
-def draw_meme_block(
-    draw: ImageDraw.ImageDraw,
-    lines: list[str],
-    font: ImageFont.FreeTypeFont,
-    stroke_width: int,
-    line_gap: int,
-    image_width: int,
-    start_y: int,
-) -> None:
-    y = start_y
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
-        line_width = bbox[2] - bbox[0]
-        line_height = bbox[3] - bbox[1]
-        x = (image_width - line_width) / 2 - bbox[0]
-        draw.text(
-            (x, y - bbox[1]),
-            line,
-            font=font,
-            fill="white",
-            stroke_width=stroke_width,
-            stroke_fill="black",
-        )
-        y += line_height + line_gap
-
-
-def render_meme_template(image_path: Path, top_text: str, bottom_text: str) -> bytes:
-    image = Image.open(image_path).convert("RGB")
-    draw = ImageDraw.Draw(image)
-    width, height = image.size
-    horizontal_padding = max(10, width // 35)
-    vertical_padding = max(10, height // 35)
-    max_text_width = max(1, width - horizontal_padding * 2)
-
-    top = normalize_meme_text(top_text)
-    bottom = normalize_meme_text(bottom_text)
-    if not top and not bottom:
-        raise ValueError("meme caption is empty")
-
-    max_font_size = max(24, min(width // 9, height // 6))
-    min_font_size = min(max_font_size, max(14, int(width * MEME_MIN_FONT_WIDTH_RATIO)))
-    max_block_height = max(1, int(height * MEME_MAX_TEXT_BLOCK_HEIGHT_RATIO))
-    if top and bottom:
-        max_block_height = min(
-            max_block_height,
-            max(1, (height - vertical_padding * 3) // 2),
-        )
-
-    top_font, top_stroke_width, top_line_gap, top_lines, top_height = fit_meme_block(
-        draw,
-        top,
-        max_font_size,
-        min_font_size,
-        max_text_width,
-        max_block_height,
-    )
-    (
-        bottom_font,
-        bottom_stroke_width,
-        bottom_line_gap,
-        bottom_lines,
-        bottom_height,
-    ) = fit_meme_block(
-        draw,
-        bottom,
-        max_font_size,
-        min_font_size,
-        max_text_width,
-        max_block_height,
-    )
-
-    if top_lines:
-        draw_meme_block(
-            draw,
-            top_lines,
-            top_font,
-            top_stroke_width,
-            top_line_gap,
-            width,
-            vertical_padding,
-        )
-    if bottom_lines:
-        bottom_y = height - vertical_padding - bottom_height
-        draw_meme_block(
-            draw,
-            bottom_lines,
-            bottom_font,
-            bottom_stroke_width,
-            bottom_line_gap,
-            width,
-            bottom_y,
-        )
-
-    buffer = BytesIO()
-    image.save(buffer, format="PNG")
-    return buffer.getvalue()
 
 
 def get_positive_int_env(env_var: str, default: int) -> int:
@@ -2095,19 +1480,6 @@ def parse_digest_json(raw_text: str) -> dict:
     return json.loads(cleaned)
 
 
-def parse_meme_caption_json(raw_text: str) -> tuple[str, str]:
-    data = parse_digest_json(raw_text)
-    if not isinstance(data, dict):
-        raise ValueError("meme caption response must be a JSON object")
-
-    top_text = " ".join(str(data.get("top_text", "")).split()).strip()
-    bottom_text = " ".join(str(data.get("bottom_text", "")).split()).strip()
-    if not top_text and not bottom_text:
-        raise ValueError("meme caption response is empty")
-
-    return top_text, bottom_text
-
-
 def parse_roast_choice_json(raw_text: str) -> tuple[str, dict]:
     data = parse_digest_json(raw_text)
     if not isinstance(data, dict):
@@ -2140,19 +1512,6 @@ def parse_roast_choice_json(raw_text: str) -> tuple[str, dict]:
     return candidates[best_index], choice
 
 
-def serialize_meme_caption_pair(top_text: str, bottom_text: str) -> str:
-    return json.dumps(
-        {"top_text": top_text, "bottom_text": bottom_text},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
-
-
-def format_meme_caption_text(top_text: str, bottom_text: str) -> str:
-    lines = [line for line in (top_text.strip(), bottom_text.strip()) if line]
-    return "\n".join(lines)
-
-
 def escape_html(text: str) -> str:
     return html.escape(text, quote=False)
 
@@ -2180,9 +1539,6 @@ def format_digest_html(data: dict) -> str:
         name = escape_html(str(nomination.get("name", "")).strip())
         reason = escape_html(str(nomination.get("reason", "")).strip())
         lines.append(f"<b>{title}</b> — {name} — {reason}")
-
-    if is_scripture_silenced():
-        return "\n".join(lines)
 
     wisdom_entry = resolve_digest_wisdom(data.get("wisdom_id"))
     lines.extend(["", scripture.format_entry_html(wisdom_entry, header="📜 <b>Мудрость дня</b>")])
@@ -2380,157 +1736,6 @@ def schedule_boot_followup(
         chat_id,
         BOOT_FOLLOWUP_DELAY_SECONDS,
         job.name,
-    )
-
-
-async def get_or_build_markov_chain(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-) -> dict[tuple[str, str], list[str]]:
-    cache: dict[int, dict] = context.application.bot_data.setdefault("markov_chain_cache", {})
-    now = datetime.now(timezone.utc)
-    refresh_interval = get_nonsense_chain_refresh_interval()
-
-    cached = cache.get(chat_id)
-    if cached is not None and now - cached["built_at"] < refresh_interval:
-        return cached["chain"]
-
-    texts = fetch_all_chat_texts(chat_id)
-    chain = build_markov_chain(texts)
-    cache[chat_id] = {"chain": chain, "built_at": now}
-    logger.info(
-        "markov chain rebuilt chat_id=%s texts=%s chain_keys=%s",
-        chat_id,
-        len(texts),
-        len(chain),
-    )
-    return chain
-
-
-async def generate_nonsense_phrase_gemini(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-) -> str | None:
-    sample = fetch_random_messages_sample(chat_id)
-    if not sample:
-        return None
-
-    character_intro = build_character_intro(context, chat_id)
-    recent_phrases = get_recent_generated_texts(context, "recent_nonsense_phrases", chat_id)
-    prompt = NONSENSE_PROMPT_TEMPLATE.format(
-        character_intro=character_intro,
-        message=sample[0],
-    )
-    prompt += format_recent_nonsense_phrases_instruction(recent_phrases)
-
-    try:
-        phrase = await generate_gemini_text_with_fallback(prompt)
-    except Exception:
-        logger.exception("nonsense reaction: Gemini error chat_id=%s", chat_id)
-        return None
-
-    phrase = " ".join(phrase.split()).strip()
-    if not phrase:
-        return None
-
-    return phrase
-
-
-async def generate_meme_caption_gemini(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    template_name: str,
-) -> tuple[str, str] | None:
-    sample = fetch_random_messages_sample(chat_id)
-    if not sample:
-        return None
-
-    character_intro = build_character_intro(context, chat_id)
-    recent_phrases = get_recent_generated_texts(context, "recent_nonsense_phrases", chat_id)
-    prompt = MEME_CAPTION_PROMPT_TEMPLATE.format(
-        character_intro=character_intro,
-        messages=" | ".join(sample),
-        template_name=template_name,
-        template_description=meme_template_description(template_name),
-    )
-    prompt += format_recent_nonsense_phrases_instruction(recent_phrases)
-
-    try:
-        raw_caption = await generate_gemini_text_with_fallback(prompt)
-        return parse_meme_caption_json(raw_caption)
-    except Exception:
-        logger.exception(
-            "nonsense reaction: Gemini meme caption error chat_id=%s template=%r",
-            chat_id,
-            template_name,
-        )
-        return None
-
-
-async def maybe_send_nonsense_reaction(
-    message: Message,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-) -> None:
-    if random.random() > get_nonsense_reaction_chance():
-        return
-
-    last_triggered_at: dict[int, datetime] = context.application.bot_data.setdefault(
-        "nonsense_last_at", {}
-    )
-    now = datetime.now(timezone.utc)
-    cooldown = get_nonsense_cooldown()
-    previous = last_triggered_at.get(chat_id)
-    if previous is not None and now - previous < cooldown:
-        return
-
-    if count_non_bot_chat_messages(chat_id) < get_nonsense_min_messages():
-        return
-
-    sent_as_meme = False
-    generated_text_for_memory: str | None = None
-    template = get_random_meme_template()
-    if template is not None and random.random() <= get_meme_render_chance():
-        template_path, template_name = template
-        caption = await generate_meme_caption_gemini(context, chat_id, template_name)
-        if caption is not None:
-            top_text, bottom_text = caption
-            fallback_text = format_meme_caption_text(top_text, bottom_text)
-            generated_text_for_memory = serialize_meme_caption_pair(top_text, bottom_text)
-            if fallback_text:
-                try:
-                    meme_bytes = render_meme_template(template_path, top_text, bottom_text)
-                    await message.reply_photo(photo=BytesIO(meme_bytes))
-                    sent_as_meme = True
-                except Exception:
-                    logger.exception(
-                        "nonsense reaction: meme render failed chat_id=%s template=%s, "
-                        "falling back to text",
-                        chat_id,
-                        template_path.name,
-                    )
-                    await message.reply_text(fallback_text)
-
-    if generated_text_for_memory is None:
-        phrase = await generate_nonsense_phrase_gemini(context, chat_id)
-        if phrase is None:
-            return
-
-        generated_text_for_memory = phrase
-        await message.reply_text(phrase)
-
-    last_triggered_at[chat_id] = now
-    remember_generated_text(
-        context,
-        "recent_nonsense_phrases",
-        chat_id,
-        generated_text_for_memory,
-    )
-    logger.info(
-        "nonsense reaction triggered chat_id=%s kind=%s text=%r",
-        chat_id,
-        "meme" if sent_as_meme else "text",
-        generated_text_for_memory[:200],
     )
 
 
@@ -2950,21 +2155,6 @@ def format_stats_html(stats: dict, tz: ZoneInfo) -> str:
     )
 
 
-async def handle_text_reactions(
-    message: Message,
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-) -> None:
-    try:
-        await maybe_send_nonsense_reaction(message, context, chat_id)
-    except Exception:
-        logger.exception(
-            "text reaction task failed chat_id=%s message_id=%s",
-            chat_id,
-            message.message_id,
-        )
-
-
 async def handle_text_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -3015,12 +2205,6 @@ async def handle_text_message(
         message.message_id,
         user.id if user else None,
         message.text[:120],
-    )
-
-    context.application.create_task(
-        handle_text_reactions(message, context, chat.id),
-        update=update,
-        name=f"text-reactions:{chat.id}:{message.message_id}",
     )
 
 
@@ -3122,7 +2306,7 @@ async def send_scripture_morning(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.warning("утреннее слово пропущено: CHAT_ID не настроен")
         return
 
-    if is_scripture_silenced():
+    if is_bot_silenced():
         logger.info("утреннее слово пропущено: чат проголосовал за тишину")
         return
 
@@ -3568,25 +2752,32 @@ def build_silence_vote_text(votes: dict[int, str], closes_at: datetime) -> str:
     no_count = sum(1 for choice in votes.values() if choice == "no")
     days = get_silence_duration().days
     return (
-        f"🤫 Голосование: {days} дн. без цитат из Библии от бота?\n"
-        f"Бот не будет сам присылать воскресное слово и мудрость дня в сводке. "
-        f"/мудрость и /стих продолжат отвечать, если их попросить.\n\n"
-        f"За: {yes_count} из {get_silence_vote_threshold()} нужных | Против: {no_count}\n"
+        "🤫 <b>Голосование за тишину</b>\n"
+        "\n"
+        f"Если наберётся {get_silence_vote_threshold()} голосов «за», я {days} дней не буду ничего писать "
+        "в чат сам:\n"
+        "• не будет вечерней сводки дня;\n"
+        "• не будет воскресного слова.\n"
+        "\n"
+        "Команды продолжат работать, если их вызвать вручную: /мудрость, /стих, /roast, /stats и другие. "
+        "За день до конца тишины я напомню, и её можно будет продлить ещё на неделю.\n"
+        "\n"
+        f"За: {yes_count} из {get_silence_vote_threshold()} | Против: {no_count}\n"
         f"Голосование открыто до {format_local_datetime(closes_at)}"
     )
 
 
 async def send_silence_reminder(context: ContextTypes.DEFAULT_TYPE) -> None:
     allowed_chat_id = get_allowed_chat_id()
-    until = get_scripture_silence_until()
+    until = get_silence_until()
     if allowed_chat_id is None or until is None or datetime.now(timezone.utc) >= until:
         return
 
     await context.bot.send_message(
         chat_id=allowed_chat_id,
         text=(
-            f"🤫 Тишина от цитат заканчивается {format_local_datetime(until)}. "
-            "Если хотите продлить ещё на неделю — /тишина."
+            f"🤫 Тишина заканчивается {format_local_datetime(until)}: после этого вернутся вечерние "
+            "сводки и воскресное слово. Хотите продлить ещё на неделю — /тишина."
         ),
     )
     logger.info("silence reminder sent chat_id=%s until=%s", allowed_chat_id, until.isoformat())
@@ -3596,7 +2787,7 @@ def schedule_silence_reminder(application: Application) -> None:
     for job in application.job_queue.get_jobs_by_name(SILENCE_REMINDER_JOB_NAME):
         job.schedule_removal()
 
-    until = get_scripture_silence_until()
+    until = get_silence_until()
     if until is None:
         return
     remind_at = until - timedelta(days=1)
@@ -3626,7 +2817,7 @@ async def handle_silence_command(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     now = datetime.now(timezone.utc)
-    until = get_scripture_silence_until()
+    until = get_silence_until()
     if until is not None and until - now > timedelta(days=1):
         await message.reply_text(
             f"Тишина уже действует до {format_local_datetime(until)}. "
@@ -3639,6 +2830,7 @@ async def handle_silence_command(update: Update, context: ContextTypes.DEFAULT_T
     sent = await message.reply_text(
         build_silence_vote_text(votes, closes_at),
         reply_markup=build_silence_keyboard(),
+        parse_mode="HTML",
     )
     session = {"message_id": sent.message_id, "votes": votes, "closes_at": closes_at, "active": True}
     session["job"] = context.application.job_queue.run_once(
@@ -3661,14 +2853,14 @@ async def finish_silence_vote(context: ContextTypes.DEFAULT_TYPE, chat_id: int, 
     yes_count = sum(1 for choice in session["votes"].values() if choice == "yes")
     if passed:
         now = datetime.now(timezone.utc)
-        current_until = get_scripture_silence_until()
+        current_until = get_silence_until()
         start = current_until if current_until is not None and current_until > now else now
         until = start + get_silence_duration()
-        set_bot_state(SCRIPTURE_SILENCE_UNTIL_KEY, until.isoformat())
+        set_bot_state(SILENCE_UNTIL_KEY, until.isoformat())
         schedule_silence_reminder(context.application)
         text = (
-            f"🤫 Решено ({yes_count} голосов): до {format_local_datetime(until)} я сам цитаты не присылаю. "
-            "Понял, не навязываюсь 🙂"
+            f"🤫 Решено ({yes_count} голосов): до {format_local_datetime(until)} молчу — без вечерних сводок "
+            "и воскресного слова. Если позовёте командой — отвечу. Понял, не навязываюсь 🙂"
         )
     else:
         text = f"Голосование закрыто: за тишину {yes_count} из {get_silence_vote_threshold()}. Всё остаётся как было."
@@ -3725,6 +2917,7 @@ async def handle_silence_callback(update: Update, context: ContextTypes.DEFAULT_
         await query.edit_message_text(
             build_silence_vote_text(session["votes"], session["closes_at"]),
             reply_markup=build_silence_keyboard(),
+            parse_mode="HTML",
         )
     except Exception:
         logger.exception("/silence failed to edit message chat_id=%s", chat.id)
@@ -3950,6 +3143,9 @@ async def send_daily_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     if allowed_chat_id is None:
         logger.warning("автосводка пропущена: CHAT_ID не настроен")
         return
+    if is_bot_silenced():
+        logger.info("автосводка пропущена: чат проголосовал за тишину")
+        return
 
     tz = get_app_timezone()
     name_map = context.application.bot_data.get("name_map", {})
@@ -4084,7 +3280,6 @@ async def post_init(application: Application) -> None:
 def main() -> None:
     setup_logging()
     init_db()
-    ensure_meme_templates()
 
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
